@@ -41,7 +41,7 @@ class GumbeldoreDataset:
         self.env_config = env_config
         self.devices_for_workers: List[str] = self.gumbeldore_config["devices_for_workers"]
 
-    def generate_dataset(self, network_weights: dict, best_objective: Optional[float] = None, memory_aggressive: bool = False):
+    def generate_dataset(self, network_weights: dict, best_objective: Optional[float] = None, memory_aggressive: bool = False, system_index: int = None, destination_path: str = None):
         
         """
         Parameters:
@@ -54,7 +54,7 @@ class GumbeldoreDataset:
         batch_size_gpu, batch_size_cpu = (self.gumbeldore_config["batch_size_per_worker"],
                                             self.gumbeldore_config["batch_size_per_cpu_worker"])
 
-        random_instance = self.env_config.create_random_problem_instance()
+        random_instance = self.env_config.create_random_problem_instance(system_index)
         problem_instances = FlowsheetDesign.design_flowsheets(random_instance, self.gen_config, self.env_config)
 
         job_pool = JobPool.remote(copy.deepcopy(problem_instances))
@@ -95,10 +95,10 @@ class GumbeldoreDataset:
         del network_weights
         torch.cuda.empty_cache()
 
-        return self.process_results(problem_instances, results)
+        return self.process_results(problem_instances, results, destination_path)
     
 
-    def process_results(self, problem_instances, results):
+    def process_results(self, problem_instances, results, destination_path):
             """
             Processes the results from Gumbeldore search and save it to a pickle. Each trajectory will be represented as a dict with the
             following keys and values
@@ -118,11 +118,17 @@ class GumbeldoreDataset:
             """
             instances = []
             metrics_return = dict()
-            instances_dict = dict()  # Use a dict to directly avoid duplicates
+            seen = set()
+            #instances_dict = dict()  # Use a dict to directly avoid duplicates
 
             for i, _ in enumerate(problem_instances):
                 for flowsheet in results[i]:  
                     if flowsheet.objective > float("-inf"):
+                        hist_key = tuple(flowsheet.history)
+                        if hist_key in seen:
+                            continue
+                        seen.add(hist_key)
+                        
                         instances.append(dict(
                             problem_instance = flowsheet.problem_instance,
                             identifier = flowsheet.identifier, 
@@ -141,17 +147,23 @@ class GumbeldoreDataset:
             metrics_return["worst_gen_obj"] = generated_objs[-1]
 
             # Now check if there already is a data file, and if so, load it and merge it.
-            destination_path = self.gumbeldore_config["destination_path"]
+            #destination_path = self.gumbeldore_config["destination_path"]
             merged_fs = generated_fs
+            feed_index = generated_fs[0]["problem_instance"]["feed_situation_index"]
             if destination_path is not None:
                 if os.path.isfile(destination_path):
                     with open(destination_path, "rb") as f:
                         existing_fs = pickle.load(f)  # list of dicts
-                    temp_d = {x["identifier"]: x for x in existing_fs + merged_fs} #check
-                    merged_fs = list(temp_d.values())
-                    merged_fs = sorted(merged_fs, key=lambda x: x["obj"], reverse=True)[
+                    
+                    existing_by_key = {(x["problem_instance"]["feed_situation_index"], x["identifier"]): x for x in existing_fs}
+                    for x in merged_fs: 
+                        key = (x["problem_instance"]["feed_situation_index"], x["identifier"])
+                        existing_by_key[key] = x
+                    merged_fs = list(existing_by_key.values())
+                    merged_fs = [x for x in merged_fs if x["problem_instance"]["feed_situation_index"] == feed_index]
+                
+                merged_fs = sorted(merged_fs, key=lambda x: x["obj"], reverse=True)[
                                     :self.gumbeldore_config["num_trajectories_to_keep"]]
-
                 # Pickle the generated data again
                 with open(destination_path, "wb") as f:
                     pickle.dump(merged_fs, f)
