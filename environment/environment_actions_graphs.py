@@ -213,6 +213,7 @@ class FlowsheetDesign:
                     if i != src_node:
                         idx = id_to_idx[i]
                         params_mask[idx] = 1 
+            
             self.current_action_mask = params_mask
             return params_mask
 
@@ -220,7 +221,6 @@ class FlowsheetDesign:
             _, unit_name = self.current_state["chosen_unit"]
             if unit_name == "add_solvent":
                 params_mask =  np.ones(100, dtype=int)
-                self.current_action_mask = params_mask #now decide components for parameters
 
             if unit_name == "mixer":
                 src_node, _ = self.current_state["chosen_open_stream"]
@@ -232,7 +232,8 @@ class FlowsheetDesign:
                             params_mask[0] = 1
                         elif name == 'out1':
                             params_mask[1] = 1
-                self.current_action_mask = params_mask # decide which outlet to select for available nodes
+            
+            self.current_action_mask = params_mask # decide which outlet to select for available nodes
 
             return params_mask
         
@@ -993,15 +994,14 @@ class FlowsheetDesign:
                 valid_node_mask[fs_num, id_to_idx[nid] + 1] = True #all other nodes get shifted by +1 
             
             # fill everything with "no edge"
-            no_edge_emb = fs.edge_expert(edge_exists=False, is_recycle=False)
-            edge_embeds[:] = no_edge_emb
+            '''no_edge_emb = fs.edge_expert(edge_exists=False, is_recycle=False)
+            edge_embeds[:] = no_edge_emb'''
 
             # now overwrite where real edges exist
             for u, v, key, edge_data in fs.sim.graph.edges(keys= True, data=True):
                 ui = id_to_idx[u]
                 vi = id_to_idx[v]               
                 if 'out0' in edge_data["output_label"]:
-                    fs_test = flow_embeds[fs_num][ui][0]
                     edge_out0_src = fs.edge_expert(edge=edge_data, edge_exists=True, is_recycle = edge_data.get("is_recycle"), feed_emb = flow_embeds[fs_num][ui][0])
                     edge_embed = edge_out0_src #+ edge_out0_dest
                 else:
@@ -1200,7 +1200,7 @@ class FlowsheetDesign:
                     np.stack([
                         np.pad(
                             ~fs.current_action_mask.astype(bool),
-                            (0, max_num_actions - num_actions_per_fs[i]),
+                            (0, max_num_actions - fs.current_action_mask.shape[0]),
                             mode='constant', constant_values=True
                         ) if fs.level  == lvl 
                         else np.ones(max_num_actions, dtype=bool)
