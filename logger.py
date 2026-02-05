@@ -43,23 +43,7 @@ class Logger:
                 f.write(json.dumps(metrics, default=str))
                 f.write("\n")
 
-    def text_artifact(self, dest_path: str, dest_text: str, destination_path_pickle: str, obj):
-        
-        if destination_path_pickle is None:
-            raise ValueError("destination pickle must not be None. Check if it exists")
-
-        with open(destination_path_pickle, "rb") as f:
-            all_fs = pickle.load(f)  # list of dicts
-
-        top_fs_list = []
-        for i, data in enumerate(obj):
-            top_fs = [fs for fs in all_fs if fs.get("identifier") in data]
-            top_fs_list.append(top_fs)
-
-        with open(dest_path, "wb") as f:
-            pickle.dump(top_fs_list, f)
-        
+    def text_artifact(self, dest_text: str, obj):
+            
         with open(dest_text, "w") as f:
             f.write(str(obj))
-
-        print(f"Saved {len(top_fs_list)} top flowsheets to {dest_path}")
