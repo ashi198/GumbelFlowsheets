@@ -16,7 +16,7 @@ class GeneralConfig:
         self.seed = 42
 
         # Network and environment
-        self.latent_dim = 512 #latent dimension for Core transformer 
+        self.latent_dim = 256 #latent dimension for Core transformer 
         self.num_transformer_blocks = 10 # Number of layers in the stack of transformer blocks for the architecture
         self.num_heads = 16 # Number of heads in the multihead attention.
         self.dropout = 0. # Dropout for feedforward layer in a transformer block.
@@ -29,13 +29,14 @@ class GeneralConfig:
 
         # Training
         self.num_dataloader_workers = 3  # Number of workers for creating batches for training
-        self.CUDA_VISIBLE_DEVICES = "0,1,2,3"  # Must be set, as ray can have problems detecting multiple GPUs
+        self.CUDA_VISIBLE_DEVICES = "0,1"  # Must be set, as ray can have problems detecting multiple GPUs
         self.training_device = "cuda:0"  # Device on which to perform the supervised training
-        self.num_epochs = 2  # Number of epochs (i.e., passes through training set) to train
-        self.batch_size_training = 512 #Batch size to use for the supervised training during finetuning. 
+        self.num_epochs = 100 # Number of epochs (i.e., passes through training set) to train
+        self.batch_size_training = 32 #Batch size to use for the supervised training during finetuning. 
         self.num_batches_per_epoch = None  # Can be None, then we just do one pass through generated dataset
 
         self.wall_clock_limit = None
+        self.mlflow_experiment = 'test'
         
 
         # Optimizer
@@ -53,7 +54,7 @@ class GeneralConfig:
         self.gumbeldore_config = {
 
             # Number of trajectories with the the highest objective function evaluation to keep for training
-            "num_trajectories_to_keep": 20,
+            "num_trajectories_to_keep": 30,
             "keep_intermediate_trajectories": True,  # if True, we consider all intermediate, terminable trajectories
             "devices_for_workers": ["cuda:0"] * 1,
             "destination_path": "./data/generated_flowsheets.pickle",
@@ -91,14 +92,14 @@ class EnvConfig:
 
         # maximum number of components present simultaneously in a flowsheet
         self.max_number_of_components = 3
-        self.max_simulator_tries = 5
+        self.max_simulator_tries = 30
 
         # ----- Phase equilibrium / property data -----
         self.systems_allowed = {
-            "acetone_chloroform": False,
-            "ethanol_water": False,
+            "acetone_chloroform": True,
+            "ethanol_water": True,
             "n-butanol_water": True,
-            "water_pyridine": False
+            "water_pyridine": True
         }
         self.dicretization_parameter_lle = 5       # LLE simplex discretization
         self.curvature_parameter_vle = 0.001       # VLE curvature fitting
@@ -205,7 +206,7 @@ class EnvConfig:
                 break
             
         # Action limits
-        self.max_total_units = 8 # overall cap on placed units (excluding feed)
+        self.max_total_units = 10 # overall cap on placed units (excluding feed)
         self.max_distillation_columns = 5
         self.max_decanters = 5
         self.max_split = 5
@@ -252,7 +253,7 @@ class EnvConfig:
 
 
     # Random feed generator
-    def create_random_problem_instance(self):
+    def create_random_problem_instance(self, sampled_index):
 
         """
         Sample a feed situation of format:
@@ -272,7 +273,7 @@ class EnvConfig:
         feed_streams = []
 
         # sample a feed situation from the PEQ generator
-        sampled_index = np.random.randint(len(self.phase_eq_generator.feed_situations))
+        #sampled_index = np.random.randint(len(self.phase_eq_generator.feed_situations))
         sampled_situation = copy.deepcopy(self.phase_eq_generator.feed_situations[sampled_index])
         # sampled_situation: [[feed_global_indices], [allowed_add_comp_global_indices], num_streams]
 
