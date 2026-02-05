@@ -27,13 +27,15 @@ def save_checkpoint(checkpoint: dict, filename: str, gen_config):
 
 
 def train_for_one_epoch(epoch: int, gen_config, env_config, network: FlowsheetNetwork, network_weights: dict,
-                        optimizer: torch.optim.Optimizer, best_objective: float):
+                        optimizer: torch.optim.Optimizer, best_objective: float, system_index: int, destination_path: str):
 
     gumbeldore_dataset = GumbeldoreDataset(gen_config, env_config)
     metrics = gumbeldore_dataset.generate_dataset(
         network_weights,
         best_objective=best_objective,
-        memory_aggressive=False
+        memory_aggressive=False, 
+        system_index = system_index, 
+        destination_path= destination_path
     )
 
     print("Generated Flowsheets")
@@ -59,6 +61,7 @@ def train_for_one_epoch(epoch: int, gen_config, env_config, network: FlowsheetNe
     accumulated_loss_lvl_one = 0
     accumulated_loss_lvl_two = 0
     accumulated_loss_lvl_three = 0
+    accumulated_loss = 0
 
     num_batches = len(dataloader)
     progress_bar = tqdm(range(num_batches))
@@ -118,6 +121,7 @@ def train_for_one_epoch(epoch: int, gen_config, env_config, network: FlowsheetNe
         scaler.update()
 
         batch_loss = loss.item()
+        accumulated_loss += loss.item()
         accumulated_loss_lvl_zero += loss_zero.item()
         accumulated_loss_lvl_one += loss_one.item()
         accumulated_loss_lvl_two += loss_two.item()
@@ -131,17 +135,18 @@ def train_for_one_epoch(epoch: int, gen_config, env_config, network: FlowsheetNe
     metrics["loss_level_one"] = accumulated_loss_lvl_one / num_batches
     metrics["loss_level_two"] = accumulated_loss_lvl_two / num_batches
     metrics["loss_level_three"] = accumulated_loss_lvl_three / num_batches
+    metrics["total_loss"] = accumulated_loss/ num_batches
 
     top_20_flowsheets = metrics["top_20_flowsheets"]
     del metrics["top_20_flowsheets"]
     return metrics, top_20_flowsheets
 
-def evaluate(eval_type: str, gen_config, env_config, network: FlowsheetNetwork):
+def evaluate(eval_type: str, gen_config, env_config, network: FlowsheetNetwork, sys_ind: int, destination_path):
     #gen_config.gumbeldore_config["destination_path"] = None
 
     gumbeldore_dataset = GumbeldoreDataset(gen_config, env_config)
 
-    metrics = gumbeldore_dataset.generate_dataset(copy.deepcopy(network.get_weights()), memory_aggressive=False)
+    metrics = gumbeldore_dataset.generate_dataset(copy.deepcopy(network.get_weights()), memory_aggressive=False, system_index= sys_ind, destination_path = destination_path)
     top_20_flowsheets = metrics["top_20_flowsheets"]
 
     metrics = {
@@ -174,12 +179,12 @@ if __name__ == '__main__':
     logger.log_hyperparams(gen_config)
 
     # set up mlflow connection 
-    '''set_mlflow_connection() 
-    model_start_time = f'esm'+ '_' + 'LD_128_batch_40_train_batch_s_256_batch_100_epoch_500_traj_2000_replay_100_' + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    if config.mlflow_experiment is None:
-        mlflow.set_experiment(experiment_name=config.protein_name + '_' + config.mode + '_' + 'replan_20_num_of_traj_10' + '_' + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))                        
+    set_mlflow_connection() 
+    model_start_time = f'test' + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if gen_config.mlflow_experiment is None:
+        mlflow.set_experiment('test' + '_' + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))                        
     else:
-        mlflow.set_experiment(config.mlflow_experiment)'''
+        mlflow.set_experiment(gen_config.mlflow_experiment)
 
     # Fix random number generator seed for better reproducibility
     np.random.seed(gen_config.seed)
@@ -238,41 +243,45 @@ if __name__ == '__main__':
             print(f"Wall clock limit of training set to {gen_config.wall_clock_limit / 3600} hours")
             start_time_counter = time.perf_counter()
 
-        #with mlflow.start_run(run_name = model_start_time):
-        for epoch in range(gen_config.num_epochs):
-            print("------")
-            print(f"Generating dataset.")
-            network_weights = copy.deepcopy(network.get_weights())
+        # uniformaly sample system indices for making problem instances
+        system_index = np.random.choice([0, 1, 2, 3], size=gen_config.num_epochs)
+            
+        with mlflow.start_run(run_name = model_start_time):
+            for epoch in range(gen_config.num_epochs):
+                print("------")
+                print(f"Generating dataset.")
+                network_weights = copy.deepcopy(network.get_weights())
 
-            #mlflow.log_params({k: v for k, v in vars(gen_config).items() if isinstance(v, (int, float, str, bool))})
-            generated_loggable_dict, generated_text_to_save = train_for_one_epoch(
-                epoch, gen_config, env_config, network, network_weights, optimizer, best_validation_metric
-            )
+                mlflow.log_params({k: v for k, v in vars(gen_config).items() if isinstance(v, (int, float, str, bool))})
 
-            # Save model
-            checkpoint["model_weights"] = copy.deepcopy(network.get_weights())
-            checkpoint["optimizer_state"] = copy.deepcopy(
-                dict_to_cpu(optimizer.state_dict())
-            )
-            val_metric = generated_loggable_dict["best_gen_obj"]   # measure by best objective found during sampling
-            checkpoint["validation_metric"] = val_metric
-            save_checkpoint(checkpoint, "last_model.pt", gen_config)
+                generated_loggable_dict, generated_text_to_save = train_for_one_epoch(
+                    epoch, gen_config, env_config, network, network_weights, optimizer, best_validation_metric, system_index[epoch], gen_config.gumbeldore_config['destination_path']
+                )
 
-            # log metrics per epoch 
-            '''for key, val in generated_loggable_dict.items():
-                mlflow.log_metric(key, val, step=epoch)'''
+                # Save model
+                checkpoint["model_weights"] = copy.deepcopy(network.get_weights())
+                checkpoint["optimizer_state"] = copy.deepcopy(
+                    dict_to_cpu(optimizer.state_dict())
+                )
+                val_metric = generated_loggable_dict["best_gen_obj"]   # measure by best objective found during sampling
+                checkpoint["validation_metric"] = val_metric
+                save_checkpoint(checkpoint, "last_model.pt", gen_config)
 
-            if val_metric > best_validation_metric:
-                print(">> Got new best model.")
-                checkpoint["best_model_weights"] = copy.deepcopy(checkpoint["model_weights"])
-                checkpoint["best_validation_metric"] = val_metric
-                best_model_weights = checkpoint["best_model_weights"]
-                best_validation_metric = val_metric
-                save_checkpoint(checkpoint, "best_model.pt", gen_config)
+                # log metrics per epoch 
+                for key, val in generated_loggable_dict.items():
+                    mlflow.log_metric(key, val, step=epoch)
 
-            if start_time_counter is not None and time.perf_counter() - start_time_counter > gen_config.wall_clock_limit:
-                print("Time exceeded. Stopping training.")
-                break
+                if val_metric > best_validation_metric:
+                    print(">> Got new best model.")
+                    checkpoint["best_model_weights"] = copy.deepcopy(checkpoint["model_weights"])
+                    checkpoint["best_validation_metric"] = val_metric
+                    best_model_weights = checkpoint["best_model_weights"]
+                    best_validation_metric = val_metric
+                    save_checkpoint(checkpoint, "best_model.pt", gen_config)
+
+                if start_time_counter is not None and time.perf_counter() - start_time_counter > gen_config.wall_clock_limit:
+                    print("Time exceeded. Stopping training.")
+                    break
 
     if gen_config.num_epochs == 0:
         print(f"Testing with loaded model.")
@@ -286,16 +295,23 @@ if __name__ == '__main__':
               "Evaluating with random model.")
 
     torch.cuda.empty_cache()
-    destination_pickle_file = gen_config.gumbeldore_config["destination_path"]
-    with torch.no_grad():
-        test_loggable_dict, test_text_to_save = evaluate('test', gen_config, env_config, network)
+    destinaton_path_results = gen_config.results_path
 
-    print(">> TEST")
-    print(test_loggable_dict)
-    logger.log_metrics(test_loggable_dict, step=0, step_desc="test")
-    print(test_text_to_save)
-    logger.text_artifact(os.path.join(gen_config.results_path, "test_20_top_flowsheets.pickle"), os.path.join(gen_config.results_path, "test_20_top_flowsheets.txt"), 
-                         destination_pickle_file, test_text_to_save)
+    # uniformaly sample system indices for making problem instances
+    system_index = [0, 1, 2, 3]
+    
+    for sys_ind in system_index: 
+        with torch.no_grad():
+            file_name_pickle = f'test_20_top_flowsheets' + '_' + 'sys_index' + '_' + str(sys_ind) + '.pickle'
+            results_path = os.path.join(gen_config.results_path, file_name_pickle)
+
+            test_loggable_dict, test_text_to_save = evaluate('test', gen_config, env_config, network, sys_ind, results_path)
+            print(">> TEST")
+            print(test_loggable_dict)
+            logger.log_metrics(test_loggable_dict, step=0, step_desc="test")
+            print(test_text_to_save)
+            file_name_txt = f'test_20_top_flowsheets' + '_' + 'sys_index' + '_' + str(sys_ind) + '.txt'
+            logger.text_artifact(os.path.join(gen_config.results_path, file_name_txt), test_text_to_save)
 
     print("Finished. Shutting down ray.")
     ray.shutdown()
