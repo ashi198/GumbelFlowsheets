@@ -288,19 +288,19 @@ class EdgeFlowExpert(nn.Module):
 
     def forward(self, edge_exists: bool, is_recycle: bool, edge=None, feed_emb = None):
 
-        if not edge_exists: 
+        '''if not edge_exists: 
             edge_idx = torch.tensor(0, dtype=torch.long, device=self.config.training_device)
-            return self.no_edge_emb(edge_idx)
+            return self.no_edge_emb(edge_idx)'''
 
         # if an edge exists (in cases of a single open stream or virtual node)
-        edge_idx = torch.tensor(1, dtype=torch.long, device=self.config.training_device)
+        #edge_idx = torch.tensor(1, dtype=torch.long, device=self.config.training_device)
 
         # if its a recycle 
         recycle_idx = torch.tensor(1 if is_recycle else 0, dtype=torch.long, device=self.config.training_device)
-        edge_emb = self.no_edge_emb(edge_idx)
+        #edge_emb = self.no_edge_emb(edge_idx)
         recycle_emb = self.is_recycle_emb(recycle_idx)
 
-        combine_edge_embed = edge_emb + recycle_emb + feed_emb
+        combine_edge_embed = recycle_emb + feed_emb
 
         return combine_edge_embed
     
