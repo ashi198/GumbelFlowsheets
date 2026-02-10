@@ -190,7 +190,7 @@ class FlowsheetDesign:
 
             elif chosen_unit_name == "add_solvent":
                 params_mask = np.zeros(len(self.env_config.component_names), dtype= int)
-                for i in self.problem_instance['indices_components_in_feeds']:
+                for i in self.problem_instance['possible_ind_add_comp']:
                     params_mask[i] = 1
             elif chosen_unit_name == "recycle":
                 node_ids = list(self.sim.graph.nodes)
@@ -221,6 +221,7 @@ class FlowsheetDesign:
             _, unit_name = self.current_state["chosen_unit"]
             if unit_name == "add_solvent":
                 params_mask =  np.ones(100, dtype=int)
+                params_mask[13] = 0
 
             if unit_name == "mixer":
                 src_node, _ = self.current_state["chosen_open_stream"]
@@ -249,7 +250,7 @@ class FlowsheetDesign:
         Level 1: For a given stream, select a unit type: <distillation_column, add_solvent, decanter, split, recycle, mixer>
         Level 2: Select parameters values for the following units 
          -- distillation column: select a distillation fraction value 
-         -- decantor: nothing 
+         -- decanter: nothing 
          -- split: select split ratio
          -- recycle: select the destination node, given a source node 
          -- mixer: select the destination node with open streams 
@@ -355,7 +356,7 @@ class FlowsheetDesign:
                     self.get_feasible_actions()
                     return False, -1000.0, True 
 
-                if unit_name == "decantor":
+                if unit_name == "decanter":
                     # immediate place (no continuous param, no second stream)
                     self.level_list.append(self.level)
                     self.history.append(action_index)
@@ -363,6 +364,7 @@ class FlowsheetDesign:
                     done, reward, worked = self._complete_action_place_and_simulate()
                     self.current_state["completed_design"] = done 
                     self.objective = reward 
+                    self.current_state['open_streams'] = self._enumerate_open_streams()
                     self.level = 0 if next_level == None else next_level
                     self.get_feasible_actions()
                     return done, reward, worked
@@ -401,22 +403,19 @@ class FlowsheetDesign:
                         return done, reward, worked
                     
                 elif self._chosen_unit_name() == "add_solvent":
-                    if action_index > 4:
-                        raise ValueError("Invalid selection for thermodynamic components")
-                    else:
-                        self.chosen_add_solvent_comp = self.env_config.component_names[action_index]
-                        self.current_state["pending_params"]["add_solvent"] = {
-                            "index_for_comp": action_index,
-                            "name_comp": self.chosen_add_solvent_comp,
-                            "index_for_amount": None,
-                            "amount_value": None,
-                        }
-                        self.level_list.append(self.level)
-                        self.history.append(action_index)
+                    self.chosen_add_solvent_comp = self.env_config.component_names[action_index]
+                    self.current_state["pending_params"]["add_solvent"] = {
+                        "index_for_comp": action_index,
+                        "name_comp": self.chosen_add_solvent_comp,
+                        "index_for_amount": None,
+                        "amount_value": None,
+                    }
+                    self.level_list.append(self.level)
+                    self.history.append(action_index)
 
-                        self.level = 3 if next_level == None else next_level
-                        self.get_feasible_actions()
-                        return False, -1000.0, True
+                    self.level = 3 if next_level == None else next_level
+                    self.get_feasible_actions()
+                    return False, -1000.0, True
                         
                 # choose destination stream for recycle
                 elif self._chosen_unit_name() == "recycle":
@@ -470,10 +469,9 @@ class FlowsheetDesign:
                 if self._chosen_unit_name() == "add_solvent":
                     _, component, _, _ = self.current_state["pending_params"]["add_solvent"].values()
                     if component:
-                        comp_map = self.env_config.add_solvent_comp_map[component]
-                        self.selected_amount = comp_map[action_index]
+                        selected_amount = self.env_config.add_solvent_comp_map[action_index]
                         self.current_state["pending_params"]["add_solvent"]["index_for_amount"] = action_index
-                        self.current_state["pending_params"]["add_solvent"]["amount_value"] = self.selected_amount
+                        self.current_state["pending_params"]["add_solvent"]["amount_value"] = selected_amount
                         self.history.append(action_index)
 
                         self.level_list.append(self.level)
@@ -525,7 +523,8 @@ class FlowsheetDesign:
             print("  exception value:", e)
             traceback.print_exc()
             # reset to prevent level loops
-            #self._reset_action_state()
+            self._reset_action_state()
+            self.remove_last_actions()
             return False, -1000.0, False
 
         return False, -1000.0, True
@@ -548,14 +547,14 @@ class FlowsheetDesign:
             return False
 
         # add_solvent: only allowed components (global indices)
-        if unit_name == "add_solvent":
+        '''if unit_name == "add_solvent":
             start = self.env_config.add_solvent_start_index
             if start is None or unit_idx < start:
                 return False
             comp_global_idx = unit_idx - start
             allowed = self.sim.feed_stream_information.get("possible_ind_add_comp", [])
             if comp_global_idx not in allowed:
-                return False
+                return False'''
 
         # mixer needs >=2 open streams
         if unit_name == "mixer":
@@ -660,10 +659,12 @@ class FlowsheetDesign:
 
             elif unit_name == "add_solvent":
                 index, component, index_for_amount, amount_value = self.current_state["pending_params"]["add_solvent"].values()
-                cont_val = amount_value
+                min_value = min(self.env_config.add_solvent_comp_map)
+                max_value = max(self.env_config.add_solvent_comp_map)
+                norm_cont_val = (amount_value - min_value) / (max_value - min_value) # apply min-max norm for the conc of solvent 
                 params = {
                     "index_new_component": index,
-                    "solvent_amount": float(cont_val),
+                    "solvent_amount": float(norm_cont_val),
                 }
 
             # Actually place
@@ -765,7 +766,7 @@ class FlowsheetDesign:
         # reward = normalized NPV
         self.current_state['npv_raw'] = self.sim.current_net_present_value
         self.current_state['npv_norm'] = self.sim.current_net_present_value_normed 
-        reward = self.sim.current_net_present_value #or 0.0
+        reward = self.sim.current_net_present_value_normed #or 0.0
         #reward = self.sim.current_net_present_value or 0.0
 
         # reset for next turn
@@ -970,7 +971,7 @@ class FlowsheetDesign:
                 if node_data["unit_type"] == "feed":
                     interaction_params = node_data['params']['system_gammas_inf']
                     system_pure_crit = node_data['params']['system_pure_crit']
-                    compon_emb, interaction_emb = fs.unit_experts["component_expert"](system_pure_crit, interaction_params)
+                    compon_emb, interaction_emb = fs.unit_experts["component_expert"](system_pure_crit, interaction_params, node_data)
                     flow_emb, open_emb = fs.open_stream_expert(node_data, compon_emb, interaction_emb)
 
                     node_embeds[fs_num, id_to_idx[nid]] =  flow_emb[0]

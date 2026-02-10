@@ -220,13 +220,10 @@ class ComponentsExpert(nn.Module):
                     idx += 2
         return gamma_local
     
-    def forward(self, system_pure_crit, system_gammas_inf):
+    def forward(self, system_pure_crit, system_gammas_inf, x):
 
         # component_params: (batch_size, num_components, 3)
         # interaction_params: (batch_size, num_components, num_components, 1)
-
-        assert len(system_pure_crit) == self.env_config.max_number_of_components * 3 
-
         compon_tensor = torch.tensor(system_pure_crit).reshape(self.env_config.max_number_of_components, 3).to(self.gen_config.training_device) #convert to tensor and add dim for batch
 
         gamma = self.flat_gamma_to_matrix(system_gammas_inf, self.env_config.max_number_of_components)

@@ -13,7 +13,7 @@ class GeneralConfig:
         
 
     def __init__(self):
-        self.seed = 42
+        self.seed = 23
 
         # Network and environment
         self.latent_dim = 256 #latent dimension for Core transformer 
@@ -24,15 +24,15 @@ class GeneralConfig:
         self.flow_latent_dim = 64
 
         # Loading trained checkpoints to resume training or evaluate
-        self.load_checkpoint_from_path = None  # If given, model checkpoint is loaded from this path.
+        self.load_checkpoint_from_path = '/media/raid5/hswt304ash/GumbelFlowsheets/results/results_256_BS_128_100_epoch/best_model.pt'  # If given, model checkpoint is loaded from this path.
         self.load_optimizer_state = False  # If True, the optimizer state is also loaded.
 
         # Training
         self.num_dataloader_workers = 3  # Number of workers for creating batches for training
-        self.CUDA_VISIBLE_DEVICES = "0,1"  # Must be set, as ray can have problems detecting multiple GPUs
-        self.training_device = "cuda:0"  # Device on which to perform the supervised training
-        self.num_epochs = 100 # Number of epochs (i.e., passes through training set) to train
-        self.batch_size_training = 32 #Batch size to use for the supervised training during finetuning. 
+        self.CUDA_VISIBLE_DEVICES = "0,1,2,3"  # Must be set, as ray can have problems detecting multiple GPUs
+        self.training_device = "cuda:3"  # Device on which to perform the supervised training
+        self.num_epochs = 50 # Number of epochs (i.e., passes through training set) to train
+        self.batch_size_training = 64 #Batch size to use for the supervised training during finetuning. 
         self.num_batches_per_epoch = None  # Can be None, then we just do one pass through generated dataset
 
         self.wall_clock_limit = None
@@ -54,14 +54,14 @@ class GeneralConfig:
         self.gumbeldore_config = {
 
             # Number of trajectories with the the highest objective function evaluation to keep for training
-            "num_trajectories_to_keep": 30,
+            "num_trajectories_to_keep": 100,
             "keep_intermediate_trajectories": True,  # if True, we consider all intermediate, terminable trajectories
-            "devices_for_workers": ["cuda:0"] * 1,
-            "destination_path": "./data/generated_flowsheets.pickle",
+            "devices_for_workers": ["cuda:3"] * 1,
+            "destination_path": "./data",
             "batch_size_per_worker": 1, 
             "batch_size_per_cpu_worker": 1,
-            "search_type": "tasar",
-            "beam_width": 32,
+            "search_type": "beam_search",
+            "beam_width": 64,
             "replan_steps": 12,
             "num_rounds": 1,  # if it's a tuple, then we sample as long as it takes to obtain a better trajectory, but for a minimum of first entry rounds and a maximum of second entry rounds
             "deterministic": False,  # Only use for gumbeldore_eval=True below, switches to regular beam search.
@@ -70,9 +70,10 @@ class GeneralConfig:
         }
 
         # Results and logging
-        self.results_path = os.path.join("./results",
+        '''self.results_path = os.path.join("./results",
                                          datetime.datetime.now().strftime(
-                                             "%Y-%m-%d--%H-%M-%S"))  # Path to store the model weights
+                                             "%Y-%m-%d--%H-%M-%S"))'''  # Path to store the model weights
+        self.results_path = '/media/raid5/hswt304ash/GumbelFlowsheets/results/results_256_BS_128_100_epoch'
         self.log_to_file = True
 
 
@@ -206,11 +207,11 @@ class EnvConfig:
                 break
             
         # Action limits
-        self.max_total_units = 10 # overall cap on placed units (excluding feed)
-        self.max_distillation_columns = 5
-        self.max_decanters = 5
-        self.max_split = 5
-        self.max_mixer = 5
+        self.max_total_units = 4 # overall cap on placed units (excluding feed)
+        self.max_distillation_columns = 3
+        self.max_decanters = 2
+        self.max_split = 1
+        self.max_mixer = 1
         self.max_recycle = 2
         self.max_solvent = 1
 
@@ -237,19 +238,7 @@ class EnvConfig:
         # List of mappings for params for distillation, split, add_solvent
         self.DF_distillation_map = np.linspace(0.01, 0.99, 100)
         self.split_ratio_map = np.linspace(0.01, 0.99, 100)
-        self.acetone_conc_map = np.linspace(0.01, 9.99, 100)
-        self.benzene_conc_map = np.linspace(0.01, 9.99, 100)
-        self.butanol_conc_map = np.linspace(0.01, 9.99, 100)
-        self.tol_conc_map = np.linspace(0.01, 9.99, 100)
-        self.water_conc_map = np.linspace(0.01, 9.99, 100)
-
-        self.add_solvent_comp_map = {
-            "acetone": self.acetone_conc_map,
-            "benzene": self.benzene_conc_map, 
-            "n-butanol": self.butanol_conc_map, 
-            "toluene": self.tol_conc_map, 
-            "water": self.water_conc_map
-                } 
+        self.add_solvent_comp_map = np.linspace(0.01, 9.99, 100)
 
 
     # Random feed generator

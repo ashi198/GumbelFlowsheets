@@ -136,7 +136,12 @@ class GumbeldoreDataset:
                             obj=flowsheet.objective,
                             graph = flowsheet.sim.graph, 
                             levels = flowsheet.level_list,
-                            status = flowsheet.current_state['completed_design']
+                            status = flowsheet.current_state['completed_design'],
+                            nvp_raw = flowsheet.sim.current_net_present_value,
+                            nvp_normed = flowsheet.sim.current_net_present_value_normed,
+                            per_ratio = flowsheet.sim.performance_ratio,
+                            npv_wo_app_cost = flowsheet.sim.npv_without_app_cost,
+
                         ))
             #generated_fs = list(instances_dict.values())
             generated_fs = instances
@@ -151,8 +156,9 @@ class GumbeldoreDataset:
             merged_fs = generated_fs
             feed_index = generated_fs[0]["problem_instance"]["feed_situation_index"]
             if destination_path is not None:
-                if os.path.isfile(destination_path):
-                    with open(destination_path, "rb") as f:
+                destination_full_path = (f"{destination_path}/generated_flowsheets_sys_{feed_index}.pickle")
+                if os.path.isfile(destination_full_path):
+                    with open(destination_full_path, "rb") as f:
                         existing_fs = pickle.load(f)  # list of dicts
                     
                     existing_by_key = {(x["problem_instance"]["feed_situation_index"], x["identifier"]): x for x in existing_fs}
@@ -165,7 +171,7 @@ class GumbeldoreDataset:
                 merged_fs = sorted(merged_fs, key=lambda x: x["obj"], reverse=True)[
                                     :self.gumbeldore_config["num_trajectories_to_keep"]]
                 # Pickle the generated data again
-                with open(destination_path, "wb") as f:
+                with open(destination_full_path, "wb") as f:
                     pickle.dump(merged_fs, f)
 
             # Get overall best metrics and flowsheets
@@ -173,7 +179,7 @@ class GumbeldoreDataset:
             metrics_return["mean_kept_obj"] = np.array([x["obj"] for x in merged_fs]).mean()
             metrics_return["top_20_flowsheets"] = [{x["identifier"]: x["obj"] for x in merged_fs[:20]}]
 
-            return metrics_return
+            return metrics_return, destination_full_path
 
 
 @ray.remote(max_calls=1)
