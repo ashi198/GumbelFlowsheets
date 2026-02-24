@@ -355,7 +355,7 @@ class FlowsheetDesign:
                     self.get_feasible_actions()
                     return False, -1000.0, True 
 
-                if unit_name == "decantor":
+                if unit_name == "decanter":
                     # immediate place (no continuous param, no second stream)
                     self.level_list.append(self.level)
                     self.history.append(action_index)
@@ -666,6 +666,8 @@ class FlowsheetDesign:
                     "solvent_amount": float(cont_val),
                 }
 
+            snap = self.sim.snapshot(include_phase=(unit_name == "add_solvent"))
+
             # Actually place
             if unit_name == "mixer":
                 index, second_o_str_name = self.current_state["pending_params"]['mixer']
@@ -728,32 +730,32 @@ class FlowsheetDesign:
             # simulate + NPV
             self.sim.simulate()
 
-        except Exception as e:
-            print ("Exception type:", type(e))
-            print("Placement/simulation failed:", e)
-            traceback.print_exc()
 
-            # rollback if we placed a unit
+        except Exception as e:
+            print("Placement/simulation failed:", e)
+
+            # 1) rollback topology changes
             if created_node_id is not None:
                 try:
                     self.sim.remove_node_and_restore_upstream_open(created_node_id)
-                    if self.current_state['chosen_unit'][1] == 'distillation_column':
-                        self.current_state['problematic_DF'] = self.current_state['pending_params']["distillation_column"][0]
-                        self.failed_simulator_call += 1
                 except Exception:
                     pass
-            # rollback recycle edge if we placed one
+
             if unit_name == "recycle":
                 try:
-                    self.sim.remove_recycle_edge(src_node, src_label, self.current_state["pending_params"]['recycle'])
+                    recycle_dest = self.current_state["pending_params"]["recycle"]
+                    self.sim.remove_recycle_edge(src_node, src_label, recycle_dest)
                 except Exception:
                     pass
 
-            # reset to avoid level loops
-            self._reset_action_state()
-            self.remove_last_actions()
+            # 2) rollback numeric state (flows/caches)
+            try:
+                self.sim.restore(snap)
+            except Exception:
+                pass
 
-            return False, -1000.0, False
+            self._reset_action_state()
+            return False, 0.0, False
 
         # update counts if worked and a *new* node was placed (recycle places no node)
         if unit_name == "recycle":
