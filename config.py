@@ -29,15 +29,15 @@ class GeneralConfig:
 
         # Training
         self.num_dataloader_workers = 3  # Number of workers for creating batches for training
-        self.CUDA_VISIBLE_DEVICES = "0,1,2,3"  # Must be set, as ray can have problems detecting multiple GPUs
-        self.training_device = "cuda:3"  # Device on which to perform the supervised training
-        self.num_epochs = 50 # Number of epochs (i.e., passes through training set) to train
-        self.batch_size_training = 64 #Batch size to use for the supervised training during finetuning. 
+        self.CUDA_VISIBLE_DEVICES = "0,1"  # Must be set, as ray can have problems detecting multiple GPUs
+        self.training_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.num_epochs = 100 # Number of epochs (i.e., passes through training set) to train
+        self.batch_size_training = 32 #Batch size to use for the supervised training during finetuning. 
         self.num_batches_per_epoch = None  # Can be None, then we just do one pass through generated dataset
 
         self.wall_clock_limit = None
         self.mlflow_experiment = 'test'
-        
+
 
         # Optimizer
         self.optimizer = {
@@ -97,10 +97,10 @@ class EnvConfig:
 
         # ----- Phase equilibrium / property data -----
         self.systems_allowed = {
-            "acetone_chloroform": True,
-            "ethanol_water": True,
+            "acetone_chloroform": False,
+            "ethanol_water": False,
             "n-butanol_water": True,
-            "water_pyridine": True
+            "water_pyridine": False
         }
         self.dicretization_parameter_lle = 5       # LLE simplex discretization
         self.curvature_parameter_vle = 0.001       # VLE curvature fitting

@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import networkx as nx
 import scipy.optimize as opt
+import copy
 
 from environment import units
 
@@ -65,6 +66,84 @@ class FlowsheetSimulationGraph:
         }
         # build initial metadata from feed indices
         self._refresh_system_metadata()
+
+    # ----- snapshot -----
+
+    def snapshot(self, include_phase: bool = False) -> dict:
+        """
+        Selective snapshot: captures only the mutable numeric payload that simulate() can change.
+        Does NOT deepcopy the NetworkX graph topology.
+        """
+        # node outputs
+        node_outputs = {}
+        for nid, ndata in self.graph.nodes(data=True):
+            of = ndata.get("output_flows", {})
+            node_outputs[nid] = {
+                lbl: (arr.copy() if isinstance(arr, np.ndarray) else None)
+                for lbl, arr in of.items()
+            }
+
+        # edge stream flows (incl. recycle tear edges)
+        edge_flows = {}
+        for u, v, k, edata in self.graph.edges(keys=True, data=True):
+            flow = edata.get("stream", {}).get("flow", None)
+            edge_flows[(u, v, k)] = (flow.copy() if isinstance(flow, np.ndarray) else None)
+
+        snap = {
+            "node_outputs": node_outputs,
+            "edge_flows": edge_flows,
+            "current_net_present_value": self.current_net_present_value,
+            "current_net_present_value_normed": self.current_net_present_value_normed,
+            "_last_recycle_guess": None if self._last_recycle_guess is None else self._last_recycle_guess.copy(),
+        }
+
+        # Only needed when an action can change component set / PEQ / metadata (add_solvent)
+        if include_phase:
+            snap["current_indices"] = list(self.current_indices)
+            snap["current_phase_eq"] = copy.deepcopy(self.current_phase_eq)
+            snap["system_metadata"] = copy.deepcopy(self.system_metadata)
+
+        return snap
+
+    def restore(self, snap: dict) -> None:
+        """
+        Restore from snapshot(). Assumes caller has already rolled back topology
+        (removed newly added nodes/edges).
+        """
+        # restore node outputs
+        saved_node_outputs = snap["node_outputs"]
+        for nid, ndata in self.graph.nodes(data=True):
+            if nid not in saved_node_outputs:
+                continue
+            of = ndata.get("output_flows", {})
+            saved = saved_node_outputs[nid]
+            for lbl in of.keys():
+                arr = saved.get(lbl, None)
+                of[lbl] = (arr.copy() if isinstance(arr, np.ndarray) else None)
+
+        # restore edge flows
+        saved_edge_flows = snap["edge_flows"]
+        for u, v, k, edata in self.graph.edges(keys=True, data=True):
+            key = (u, v, k)
+            if key not in saved_edge_flows:
+                continue
+            flow = saved_edge_flows[key]
+            edata.setdefault("stream", {})
+            if flow is None:
+                edata["stream"].pop("flow", None)
+            else:
+                edata["stream"]["flow"] = flow.copy()
+
+        # restore caches/scalars
+        self.current_net_present_value = snap["current_net_present_value"]
+        self.current_net_present_value_normed = snap["current_net_present_value_normed"]
+        self._last_recycle_guess = snap["_last_recycle_guess"]
+
+        # restore phase state if present
+        if "current_indices" in snap:
+            self.current_indices = list(snap["current_indices"])
+            self.current_phase_eq = snap["current_phase_eq"]
+            self.system_metadata = snap["system_metadata"]
 
     # ----- graph builders -----
 
@@ -157,15 +236,16 @@ class FlowsheetSimulationGraph:
         )
 
     def remove_node_and_restore_upstream_open(self, node_id: int) -> None:
-        """
-        Remove a just-created unit node and restore its upstream edges as open streams again.
-        Safe to call immediately after a failed placement/simulation.
-        """
-        if node_id not in self.graph:
-            return
-        self.graph.remove_node(node_id)
-        # inbound edges' sources regain their output as open (no explicit mark needed;
-        # simulate() will see them as open because they have no outgoing consumer now)
+        if node_id in self.graph:
+            self.graph.remove_node(node_id)
+
+    def remove_recycle_edge(self, from_node: int, output_label: str, to_node: int) -> None:
+        for u, v, k, d in list(self.graph.edges(keys=True, data=True)):
+            if not d.get("is_recycle", False):
+                continue
+            if u == from_node and v == to_node and d.get("output_label") == output_label:
+                self.graph.remove_edge(u, v, key=k)
+                break
 
     # ------------------- simulate -------------------
 
@@ -725,17 +805,17 @@ class FlowsheetSimulationGraph:
                 eligible.append(nid)
         return eligible
 
-    def remove_recycle_edge(self, from_node: int, output_label: str, to_node: int) -> None:
-        """
-        Remove a recycle edge (if present) between (from_node, output_label) -> to_node.
-        Safe to call if the edge is missing.
-        """
-        for u, v, k, d in list(self.graph.edges(keys=True, data=True)):
-            if not d.get("is_recycle", False):
-                continue
-            if u == from_node and v == to_node and d.get("output_label") == output_label:
-                self.graph.remove_edge(u, v, key=k)
-                break
+    # def remove_recycle_edge(self, from_node: int, output_label: str, to_node: int) -> None:
+    #     """
+    #     Remove a recycle edge (if present) between (from_node, output_label) -> to_node.
+    #     Safe to call if the edge is missing.
+    #     """
+    #     for u, v, k, d in list(self.graph.edges(keys=True, data=True)):
+    #         if not d.get("is_recycle", False):
+    #             continue
+    #         if u == from_node and v == to_node and d.get("output_label") == output_label:
+    #             self.graph.remove_edge(u, v, key=k)
+    #             break
 
     def _set_active_phase_eq_from_current_indices(self) -> None:
         names = [self.env_config.phase_eq_generator.names_components[i] for i in self.current_indices]
