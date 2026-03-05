@@ -39,7 +39,6 @@ class RandomDataset(Dataset):
         self.batch_size = batch_size
         self.custom_num_batches = custom_num_batches
         self.path_to_pickle = path_to_pickle
-        self.SKIP_ACTION = 901
         with open(path_to_pickle, "rb") as f:
             self.instances = pickle.load(f)  # list of dictionaries
 
@@ -79,6 +78,7 @@ class RandomDataset(Dataset):
                 self._flat_levels.append(fs.level)
                 if j + 1 < len(instance["levels"]):
                     fs.take_action(action, instance['levels'][j + 1])
+                    #fs.take_action(action, None)
                 else:
                     fs.take_action(action, None)
 
