@@ -49,7 +49,7 @@ class FlowsheetDesign:
         # current action state
         self.level = 0 
         self.failed_simulator_call = 0
-        self.valid_nodes: torch.Tensor = None 
+        self.valid_nodes: torch.Tensor = None
 
         # counters (limits)
         self.counts = {
@@ -77,8 +77,9 @@ class FlowsheetDesign:
         self.open_stream_expert = OpenStreamExpert(self.gen_config, self.env_config, self.unit_experts["flow_expert"]).to(self.gen_config.training_device)
         self.total_units_placed = 0
         self.history: List[int] = []
-        self.level_list: List[int] = [] 
-        
+        self.level_list: List[int] = []
+        self._action_seq_start = 0
+
         self.current_action_mask: Optional[np.array] = None # The action mask indicates before each action what is feasible at the current level.
 
         # initial simulate to populate open streams/NPV
@@ -94,7 +95,7 @@ class FlowsheetDesign:
             "open_streams": self._enumerate_open_streams(), # # (node_id, label) of exisiting streams 
             "chosen_open_stream": None, # Optional[Tuple[int, str]] # (node_id, label)
             "chosen_unit": None, # Optional[Tuple[int, str]] 
-            
+
             "pending_params": {
             "distillation_column": None,
             "split": None,
@@ -111,8 +112,7 @@ class FlowsheetDesign:
             "completed_design": None, # True only when termination criteria has been reached
             "second_open_stream_dest_node": None, #Optional[int] 
             "second_open_stream": None, #Optional[Tuple[int, str]]
-            "recycle_dest_unit": None, #Optional[int] 
-            "problematic_DF": None,
+            "recycle_dest_unit": None, #Optional[int]
             "current_action_mask": self.current_action_mask,
                             }
         return state
@@ -184,10 +184,7 @@ class FlowsheetDesign:
             _, chosen_unit_name = self.current_state["chosen_unit"]
 
             if chosen_unit_name in ["distillation_column", "split"]:
-                params_mask = np.ones(100, dtype=int) 
-                if chosen_unit_name == "distillation_column" and self.current_state['problematic_DF'] is not None:
-                    params_mask[self.current_state['problematic_DF']] = 0 # this is to mask out any problematic DF ratio that the agent chose which led to simulation failure
-
+                params_mask = np.ones(100, dtype=int)
             elif chosen_unit_name == "add_solvent":
                 params_mask = np.zeros(len(self.env_config.component_names), dtype= int)
                 for i in self.problem_instance['possible_ind_add_comp']:
@@ -221,7 +218,6 @@ class FlowsheetDesign:
             _, unit_name = self.current_state["chosen_unit"]
             if unit_name == "add_solvent":
                 params_mask =  np.ones(100, dtype=int)
-                params_mask[13] = 0
 
             if unit_name == "mixer":
                 src_node, _ = self.current_state["chosen_open_stream"]
@@ -273,7 +269,12 @@ class FlowsheetDesign:
             f"Trying to take action {action_index} on level {self.level}, but it is set to infeasible"'''
         
         if action_index >= len(self.current_action_mask):
-            raise ValueError(f"Invalid action {action_index}, mask size {len(self.current_action_mask)}") 
+            raise ValueError(f"Invalid action {action_index}, mask size {len(self.current_action_mask)}")
+
+        if self.current_action_mask[action_index] != 1:
+            raise ValueError(
+                f"Action {action_index} is masked at level {self.level} and cannot be taken."
+            )
         
         try:
             action_index = int(action_index)
@@ -282,7 +283,8 @@ class FlowsheetDesign:
             open_streams = self._enumerate_open_streams()
             self.current_state['open_streams'] = open_streams
 
-            if self.level == 0:      
+            if self.level == 0:
+                self._action_seq_start = len(self.history)
                 if action_index == 0:  # Check this later 
                     self.current_state['completed_design'] = True 
                     self.level_list.append(self.level)
@@ -292,7 +294,7 @@ class FlowsheetDesign:
                     '''if self.failed_simulator_call >= self.env_config.max_simulator_tries:
                         return True, -1000, True''' 
                     return True, self.objective, True
-                
+
                 # if not terminate index, then open_stream selected 
                 selected_stream = open_streams[action_index - 1], 
                 self.current_state['chosen_open_stream'] = selected_stream[0]
@@ -423,7 +425,7 @@ class FlowsheetDesign:
                     node_ids = list(self.sim.graph.nodes)
                     id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
                     idx_to_id = {v: k for k, v in id_to_idx.items()}
-                    if len(dests) < 0:
+                    if len(dests) == 0:
                         raise ValueError("No destination stream available for recycle ")
                     else:
                         # select destination and simulate 
@@ -455,7 +457,7 @@ class FlowsheetDesign:
                     if idx_to_id[action_index] in candidate_nodes:
                         self.current_state["second_open_stream_dest_node"] = idx_to_id[action_index] 
 
-                    if not self.current_state["second_open_stream_dest_node"]:
+                    if self.current_state["second_open_stream_dest_node"] is None:
                         raise RuntimeError("Selection for mixer node not valid")
                     
                     self.level_list.append(self.level)
@@ -469,7 +471,8 @@ class FlowsheetDesign:
                 if self._chosen_unit_name() == "add_solvent":
                     _, component, _, _ = self.current_state["pending_params"]["add_solvent"].values()
                     if component:
-                        selected_amount = self.env_config.add_solvent_comp_map[action_index]
+                        comp_name = self.current_state["pending_params"]["add_solvent"]["name_comp"]
+                        selected_amount = self.env_config.add_solvent_comp_map[comp_name][action_index]
                         self.current_state["pending_params"]["add_solvent"]["index_for_amount"] = action_index
                         self.current_state["pending_params"]["add_solvent"]["amount_value"] = selected_amount
                         self.history.append(action_index)
@@ -489,12 +492,16 @@ class FlowsheetDesign:
                     for i, out in all_candidates:
                         if i == index_value and i != src_node:
                             true_cands.append((i, out))
-                    
+
+                    out_value = None
                     for i, name in true_cands:
                         if action_index == 1 and name == 'out1':
                             out_value = 'out1'
                         elif action_index == 0 and name == 'out0':
                             out_value = 'out0'
+
+                    if out_value is None:
+                        raise RuntimeError("Selected mixer outlet is not valid for the chosen destination node.")
 
                     self.current_state["pending_params"]["mixer"] = (index_value, out_value)
                     self.history.append(action_index) 
@@ -524,7 +531,7 @@ class FlowsheetDesign:
             traceback.print_exc()
             # reset to prevent level loops
             self._reset_action_state()
-            self.remove_last_actions()
+            self._rollback_action_history()
             return False, -1000.0, False
 
         return False, -1000.0, True
@@ -571,13 +578,16 @@ class FlowsheetDesign:
             if self.current_state["chosen_open_stream"] is None:
                 return False
             src_node, _ = self.current_state["chosen_open_stream"]
-            if not self.sim.get_units_with_single_input(exclude=src_node):
+            if not self.sim.get_units_with_available_input(exclude=src_node):
                 return False
 
         return True
 
     def _chosen_unit_name(self) -> Optional[str]:
-        chosen_unit_index, _ = self.current_state["chosen_unit"]
+        chosen = self.current_state["chosen_unit"]
+        if chosen is None:
+            return None
+        chosen_unit_index, _ = chosen
         if chosen_unit_index is None:
             return None
         return self.env_config.units_map_indices_type[chosen_unit_index]
@@ -647,6 +657,8 @@ class FlowsheetDesign:
         # Build params per unit
         params: Dict[str, Any] = {}
         created_node_id: Optional[int] = None
+        snap = None
+        edge_snap = None
 
         try:
             # Continuous param (if any)
@@ -658,13 +670,11 @@ class FlowsheetDesign:
                 params["split_ratio"] = cont_val
 
             elif unit_name == "add_solvent":
-                index, component, index_for_amount, amount_value = self.current_state["pending_params"]["add_solvent"].values()
-                min_value = min(self.env_config.add_solvent_comp_map)
-                max_value = max(self.env_config.add_solvent_comp_map)
-                norm_cont_val = (amount_value - min_value) / (max_value - min_value) # apply min-max norm for the conc of solvent 
+                index, component, index_for_amount, amount_value = self.current_state["pending_params"][
+                    "add_solvent"].values()
                 params = {
                     "index_new_component": index,
-                    "solvent_amount": float(norm_cont_val),
+                    "solvent_amount": float(amount_value),
                 }
 
             snap = self.sim.snapshot(include_phase=(unit_name == "add_solvent"))
@@ -684,11 +694,12 @@ class FlowsheetDesign:
 
             elif unit_name == "recycle":
                 recycle_dest = self.current_state["pending_params"]["recycle"]
+                edge_snap = self.sim.snapshot_edges()
                 if recycle_dest is None:
                     raise RuntimeError("Recycle requires a destination unit to be chosen.")
                 if recycle_dest == src_node:
                     raise ValueError("Cannot recycle a stream back into its own producing unit.")
-                
+
                 # Add recycle edge (transactional)
                 self.sim.add_recycle(src_node, src_label, recycle_dest)
                 created_node_id = None  # no new node
@@ -730,32 +741,28 @@ class FlowsheetDesign:
 
             # simulate + NPV
             self.sim.simulate()
-
+            self.failed_simulator_call = 0
 
         except Exception as e:
             print("Placement/simulation failed:", e)
-
-            # 1) rollback topology changes
-            if created_node_id is not None:
+            if unit_name == "recycle" and edge_snap is not None:
+                try:
+                    self.sim.restore_edges(edge_snap)
+                except Exception:
+                    pass
+            elif created_node_id is not None:
                 try:
                     self.sim.remove_node_and_restore_upstream_open(created_node_id)
                 except Exception:
                     pass
-
-            if unit_name == "recycle":
+            if snap is not None:
                 try:
-                    recycle_dest = self.current_state["pending_params"]["recycle"]
-                    self.sim.remove_recycle_edge(src_node, src_label, recycle_dest)
+                    self.sim.restore(snap)
                 except Exception:
                     pass
-
-            # 2) rollback numeric state (flows/caches)
-            try:
-                self.sim.restore(snap)
-            except Exception:
-                pass
-
             self._reset_action_state()
+            self._rollback_action_history()
+            self.failed_simulator_call += 1
             return False, 0.0, False
 
         # update counts if worked and a *new* node was placed (recycle places no node)
@@ -777,37 +784,41 @@ class FlowsheetDesign:
         # termination condition based on max units
         self.current_state['completed_design'] = self.total_units_placed >= getattr(self.env_config, "max_total_units", 9999)
         return False, reward, True
-    
-    def remove_last_actions(self):
-        
-        '''
-        Simulation is only likely to fail for recycle and distillation. Removes the last three actions and resets the state.
 
-        '''
-        history = self.history
-        updated_history = history[:-3]
-        self.history = updated_history
-        self.level_list = self.level_list[:-3]
-
+    def _rollback_action_history(self):
+        start = getattr(self, "_action_seq_start", 0)
+        self.history = self.history[:start]
+        self.level_list = self.level_list[:start]
 
     def _reset_action_state(self):
-        
         """
-        
-        Reset all current state variables in case the simulation fails 
-        
+        Reset all current state variables in case the simulation fails
         """
-        self.current_state["current_level"] = 0 
+        self.level = 0
+        self.current_state["current_level"] = 0
         self.current_state["open_streams"] = self._enumerate_open_streams()
-        self.current_state["chosen_unit"] = None 
-        self.current_state["chosen_open_stream"] = None  
-        self.current_state["npv_raw"] = None 
-        self.current_state["npv_norm"] = None 
-        self.current_state["completed_design"] = None 
+        self.current_state["chosen_unit"] = None
+        self.current_state["chosen_open_stream"] = None
+        self.current_state["pending_params"] = {
+            "distillation_column": None,
+            "split": None,
+            "recycle": None,
+            "add_solvent": {
+                "index_for_comp": None,
+                "name_comp": None,
+                "index_for_amount": None,
+                "amount_value": None,
+            },
+            "mixer": None,
+        }
+        self.current_state["npv_raw"] = None
+        self.current_state["npv_norm"] = None
+        self.current_state["completed_design"] = False
         self.current_state["second_open_stream_dest_node"] = None
         self.current_state["second_open_stream"] = None
-        self.current_state["recycle_dest_unit"] = None 
+        self.current_state["recycle_dest_unit"] = None
         self.current_state["current_action_mask"] = None
+        self.get_feasible_actions()
 
 
     def _eligible_recycle_destinations(self) -> List[int]:
@@ -822,7 +833,7 @@ class FlowsheetDesign:
             return []
         
         origin_node_id = self.current_state["chosen_open_stream"][0]
-        dests = list(self.sim.get_units_with_single_input())  # simulator's base filter
+        dests = list(self.sim.get_units_with_available_input())  # simulator's base filter
         # exclude origin and feeds (can't recycle into feed)
         dests = [nid for nid in dests if nid != origin_node_id and nid not in getattr(self.sim, "feed_nodes", [])]
         return dests
@@ -1023,7 +1034,7 @@ class FlowsheetDesign:
     def transition_fn(self, action: int) -> Tuple['BaseTrajectory', bool]:
         copied_fs= copy.deepcopy(self)
         copied_fs.take_action(action, None)
-        return copied_fs, copied_fs.current_state['completed_design']
+        return copied_fs, copied_fs.current_state["completed_design"]
     
     def to_max_evaluation_fn(self) -> float:
         if self.objective is None:
