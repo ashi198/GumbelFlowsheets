@@ -41,7 +41,8 @@ class GumbeldoreDataset:
         self.env_config = env_config
         self.devices_for_workers: List[str] = self.gumbeldore_config["devices_for_workers"]
 
-    def generate_dataset(self, network_weights: dict, best_objective: Optional[float] = None, memory_aggressive: bool = False, system_index: int = None, destination_path: str = None):
+    def generate_dataset(self, network_weights: dict, best_objective: Optional[float] = None, memory_aggressive: bool = False, instance: dict = None, destination_path: str = None,
+                         if_test: bool = None):
         
         """
         Parameters:
@@ -54,8 +55,8 @@ class GumbeldoreDataset:
         batch_size_gpu, batch_size_cpu = (self.gumbeldore_config["batch_size_per_worker"],
                                             self.gumbeldore_config["batch_size_per_cpu_worker"])
 
-        random_instance = self.env_config.create_random_problem_instance(system_index)
-        problem_instances = FlowsheetDesign.design_flowsheets(random_instance, self.gen_config, self.env_config)
+        #random_instance = self.env_config.create_random_problem_instance(system_index)
+        problem_instances = FlowsheetDesign.design_flowsheets(instance, self.gen_config, self.env_config)
 
         job_pool = JobPool.remote(copy.deepcopy(problem_instances))
         results = [None] * len(problem_instances)
@@ -95,10 +96,10 @@ class GumbeldoreDataset:
         del network_weights
         torch.cuda.empty_cache()
 
-        return self.process_results(problem_instances, results, destination_path)
+        return self.process_results(problem_instances, results, destination_path, if_test)
     
 
-    def process_results(self, problem_instances, results, destination_path):
+    def process_results(self, problem_instances, results, destination_path, if_test):
             """
             Processes the results from Gumbeldore search and save it to a pickle. Each trajectory will be represented as a dict with the
             following keys and values
@@ -153,8 +154,17 @@ class GumbeldoreDataset:
 
             # Now check if there already is a data file, and if so, load it and merge it.
             #destination_path = self.gumbeldore_config["destination_path"]
-            merged_fs = generated_fs
-            feed_index = generated_fs[0]["problem_instance"]["feed_situation_index"]
+            #merged_fs = generated_fs
+
+            if destination_path is not None:
+                destination_full_path = (f"{destination_path}/generated_flowsheets.pickle") 
+                merged_fs = sorted(generated_fs, key=lambda x: x["obj"], reverse=True)[
+                                    :self.gumbeldore_config["num_trajectories_to_keep"]]
+            
+            with open(destination_full_path, "wb") as f:
+                    pickle.dump(merged_fs, f)
+
+            ''''feed_index = generated_fs[0]["problem_instance"]["feed_situation_index"]
             if destination_path is not None:
                 destination_full_path = (f"{destination_path}/generated_flowsheets_sys_{feed_index}.pickle")
                 if os.path.isfile(destination_full_path):
@@ -172,12 +182,18 @@ class GumbeldoreDataset:
                                     :self.gumbeldore_config["num_trajectories_to_keep"]]
                 # Pickle the generated data again
                 with open(destination_full_path, "wb") as f:
-                    pickle.dump(merged_fs, f)
+                    pickle.dump(merged_fs, f)'''
 
             # Get overall best metrics and flowsheets
-            metrics_return["mean_top_20_obj"] = np.array([x["obj"] for x in merged_fs[:20]]).mean()
-            metrics_return["mean_kept_obj"] = np.array([x["obj"] for x in merged_fs]).mean()
-            metrics_return["top_20_flowsheets"] = [{x["identifier"]: x["obj"] for x in merged_fs[:20]}]
+
+            if if_test == False:
+                metrics_return["mean_top_20_obj"] = np.array([x["obj"] for x in merged_fs[:20]]).mean()
+                metrics_return["mean_kept_obj"] = np.array([x["obj"] for x in merged_fs]).mean()
+                metrics_return["top_20_flowsheets"] = [{x["identifier"]: x["obj"] for x in merged_fs[:20]}]
+            else:
+                metrics_return["mean_top_20_obj"] = np.array([x["obj"] for x in merged_fs[:5]]).mean()
+                metrics_return["mean_kept_obj"] = np.array([x["obj"] for x in merged_fs]).mean()
+                metrics_return["top_20_flowsheets"] = [{x["identifier"]: x["obj"] for x in merged_fs[:5]}]
 
             return metrics_return, destination_full_path
 
