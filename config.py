@@ -2,7 +2,7 @@ import numpy as np
 import os, datetime, copy
 import environment.phase_equilibria.phase_eq_handling as phase_eq_generation
 from environment import units 
-import torch
+import torch, pickle, random
 
 class GeneralConfig:
 
@@ -37,6 +37,7 @@ class GeneralConfig:
 
         self.wall_clock_limit = None
         self.mlflow_experiment = 'test'
+        self.steps = 20 #how many instances per systems should be tested
         
 
         # Optimizer
@@ -60,7 +61,7 @@ class GeneralConfig:
             "destination_path": "./data",
             "batch_size_per_worker": 1, 
             "batch_size_per_cpu_worker": 1,
-            "search_type": "beam_search",
+            "search_type": "tasar",
             "beam_width": 64,
             "replan_steps": 12,
             "num_rounds": 1,  # if it's a tuple, then we sample as long as it takes to obtain a better trajectory, but for a minimum of first entry rounds and a maximum of second entry rounds
@@ -74,6 +75,9 @@ class GeneralConfig:
                                          datetime.datetime.now().strftime(
                                              "%Y-%m-%d--%H-%M-%S"))'''  # Path to store the model weights
         self.results_path = '/media/raid5/hswt304ash/GumbelFlowsheets/results/results_256_BS_128_100_epoch'
+        self.test_path = os.path.join("./test",
+                                         datetime.datetime.now().strftime(
+                                             "%Y-%m-%d--%H-%M-%S"))
         self.log_to_file = True
 
 
@@ -294,3 +298,117 @@ class EnvConfig:
             "lle_for_start": None,
             "vle_for_start": None
         }
+    
+    def generate_test_sets(self, steps, path):
+        
+        # generate and store test sets for arena, eval etc
+        # we do this always for the same seed
+        np.random.seed(42)
+        test_instances = []
+
+        # for some situations, we want to test the agent on feeds provided by literature (of
+        # course only if these are considered in this training process):
+        # Acetone Chloroform: equimolar, wang2018
+        # Water Ethanol: equimolar, kunnakorn2013
+        # Butanol Water: 0.4 But, 0.6 W, luyben2008
+        # Water Pyridine: 0.1 P, 0.9 W, chen2015
+
+        if self.systems_allowed["acetone_chloroform"]:
+            temp_test = self.helper_test_set_generation(
+                names=["acetone", "chloroform"], steps=steps,
+                set_feeds=[[np.array([0.5, 0.5, 0])]])
+
+            test_instances = test_instances + temp_test
+
+        if self.systems_allowed["ethanol_water"]:
+            temp_test = self.helper_test_set_generation(
+                names=["ethanol", "water"], steps=steps,
+                set_feeds=[[np.array([0.5, 0.5, 0])]])
+
+            test_instances = test_instances + temp_test
+
+        if self.systems_allowed["n-butanol_water"]:
+            temp_test = self.helper_test_set_generation(
+                names=["n-butanol", "water"], steps=steps,
+                set_feeds=[[np.array([0.4, 0.6, 0])]])
+
+            test_instances = test_instances + temp_test
+
+        if self.systems_allowed["water_pyridine"]:
+            temp_test = self.helper_test_set_generation(
+                names=["water", "pyridine"], steps=steps,
+                set_feeds=[[np.array([0.9, 0.1, 0])]])
+
+            test_instances = test_instances + temp_test
+
+        with open(f"{path}/test.pickle",'wb') as file:
+            pickle.dump(test_instances, file)
+
+        test_instances
+
+
+    def find_sit_create_instance(self, spec_feeds, names_comps):
+        for sit_ind in range(len(self.phase_eq_generator.feed_situations)):
+            if len(self.phase_eq_generator.feed_situations[sit_ind][0]) == len(names_comps):
+                all_in = True
+                for name in names_comps:
+                    if not self.phase_eq_generator.names_components.index(name) in \
+                        self.phase_eq_generator.feed_situations[sit_ind][0]:
+                        all_in = False
+                        break
+
+                if all_in:
+                    index = sit_ind
+                    break
+
+        situation = copy.deepcopy(self.phase_eq_generator.feed_situations[index])
+
+        # we do not shuffle in this case
+        # get names in feed streams
+        names_in_streams = []
+        for i in situation[0]:
+            names_in_streams.append(self.phase_eq_generator.names_components[i])
+
+        instance = {"feed_situation_index": index,
+                    "indices_components_in_feeds": situation[0],
+                    "list_feed_streams": spec_feeds,
+                    "possible_ind_add_comp": situation[1],
+                    "comp_order_feeds": names_in_streams,
+                    "lle_for_start": None,
+                    "vle_for_start": None}
+
+        return instance
+
+
+    def helper_test_set_generation(self, names, steps, set_feeds=None):
+        test_instances = []
+
+        # set_feeds is a list of lists, containing preset feed stream lists
+        if set_feeds is not None:
+            for feeds in set_feeds:
+                instance = self.find_sit_create_instance(spec_feeds=feeds,
+                                                    names_comps=names)
+
+                test_instances.append(instance)
+
+        for i in range(steps - 1):
+            instance = self.find_sit_create_instance(
+                spec_feeds=[np.array([(i + 1) * (1 / steps), 1 - ((i + 1) * (1 / steps)), 0])],
+                names_comps=names)
+
+            test_instances.append(instance)
+
+        return test_instances
+    
+
+    def generate_training_sets(self, system_indices, path):
+
+        train_instances = []
+
+        # create random problem instances to store
+        for _, num in enumerate(system_indices):
+            train_instances.append(self.create_random_problem_instance(num))
+
+        with open(f"{path}/train.pickle",'wb') as file:
+            pickle.dump(train_instances, file)
+        
