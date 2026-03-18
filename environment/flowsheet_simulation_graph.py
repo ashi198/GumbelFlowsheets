@@ -145,6 +145,14 @@ class FlowsheetSimulationGraph:
             self.current_phase_eq = snap["current_phase_eq"]
             self.system_metadata = snap["system_metadata"]
 
+    def snapshot_edges(self):
+        return [(u, v, k, copy.deepcopy(d)) for u, v, k, d in self.graph.edges(keys=True, data=True)]
+
+    def restore_edges(self, edge_snapshot):
+        self.graph.remove_edges_from(list(self.graph.edges(keys=True)))
+        for u, v, k, d in edge_snapshot:
+            self.graph.add_edge(u, v, key=k, **copy.deepcopy(d))
+
     # ----- graph builders -----
 
     def add_feed(self, flow: np.ndarray) -> int:
@@ -216,16 +224,6 @@ class FlowsheetSimulationGraph:
         # confirm source stream is still open
         self._consume_open_stream(from_node, output_label)  # checks the stream exists & is open
 
-        # destination checks. maybe not necessary with wrapper
-        # if to_node not in self.graph:
-        #     raise ValueError(f"Destination node {to_node} does not exist.")
-        # ut = self.graph.nodes[to_node].get("unit_type")
-        # if ut == "feed":
-        #     raise ValueError("Cannot recycle into a feed node.")
-        # indeg = sum(1 for _ in self.graph.in_edges(to_node, keys=True))
-        # if indeg > 2:  # matches your "max 3 inputs" rule -> block when already >2
-        #     raise ValueError("Destination already has too many inputs.")
-
         # wire recycle edge
         self.graph.add_edge(
             from_node,
@@ -278,12 +276,6 @@ class FlowsheetSimulationGraph:
                 continue
 
             if unit_type == "feed":
-                # out0 = self.graph.nodes[node_id]["output_flows"].get("out0")
-                # if out0 is not None:
-                #     for u, v, key, data in self.graph.out_edges(node_id, keys=True, data=True):
-                #         data.setdefault("stream", {})
-                #         data["stream"]["flow"] = np.array(out0, dtype=float)
-                # feed already has output_flows set at creation
                 continue
 
             total_input = self._sum_inbound_streams(node_id)
@@ -614,9 +606,8 @@ class FlowsheetSimulationGraph:
     # ----- helpers -------
 
     def _new_node_id(self) -> int:
-        nid = 0 if len(self.graph.nodes) == 0 else len(self.graph.nodes)
-        #self.next_node_id += 1
-        #nid = len(self.graph.nodes) - 1
+        nid = self.next_node_id
+        self.next_node_id += 1
         return nid
 
     def _refresh_system_metadata(self) -> None:
@@ -725,25 +716,6 @@ class FlowsheetSimulationGraph:
         #     if d.get("output_label") == label:
         #         raise RuntimeError(f"Stream ({node_id}, {label}) is already connected to a consumer.")
 
-    def _update_phase_eq_after_solvent(self, node_id: int, new_global_index: int) -> None:
-        """
-        Informational: stash the new subsystem PEQ after adding solvent.
-        """
-        # Determine present (nonzero) components from *output* of this node
-        out = self.graph.nodes[node_id]["output_flows"].get("out0")
-        if out is None:
-            return
-        tol = 1e-10
-        indices = [i for i, x in enumerate(out) if x > tol]
-        names = [self.env_config.phase_eq_generator.names_components[i] for i in indices]
-        try:
-            phase_eq_dict = self.env_config.phase_eq_generator.search_subsystem_phase_eq(names)
-            self.graph.nodes[node_id]["phase_eq"] = phase_eq_dict
-        except Exception:
-            # If a ternary does not exist, we simply leave phase_eq unset; the next unit
-            # that requires PEQ will raise at its own call
-            pass
-
     def _peq_indices(self) -> list:
         """
         Return the component index order for the active phase-eq model.
@@ -789,7 +761,7 @@ class FlowsheetSimulationGraph:
                     opens.append((nid, lbl))
         return opens
 
-    def get_units_with_single_input(self, exclude: Optional[int] = None) -> list:
+    def get_units_with_available_input(self, exclude: Optional[int] = None) -> list:
         """
         Return units that currently already have a certain number of inputs (currently 3 (more should be impossible),
         excluding feeds and optionally excluding a particular node_id.
@@ -804,18 +776,6 @@ class FlowsheetSimulationGraph:
             if self.graph.in_degree(nid) <= 2:
                 eligible.append(nid)
         return eligible
-
-    # def remove_recycle_edge(self, from_node: int, output_label: str, to_node: int) -> None:
-    #     """
-    #     Remove a recycle edge (if present) between (from_node, output_label) -> to_node.
-    #     Safe to call if the edge is missing.
-    #     """
-    #     for u, v, k, d in list(self.graph.edges(keys=True, data=True)):
-    #         if not d.get("is_recycle", False):
-    #             continue
-    #         if u == from_node and v == to_node and d.get("output_label") == output_label:
-    #             self.graph.remove_edge(u, v, key=k)
-    #             break
 
     def _set_active_phase_eq_from_current_indices(self) -> None:
         names = [self.env_config.phase_eq_generator.names_components[i] for i in self.current_indices]
@@ -871,24 +831,15 @@ class FlowsheetSimulationGraph:
                 total_products += np.array(flow, dtype=float)
 
         diff = effective_feed - total_products
-
-        # tolerance
         total_feed_sum = float(np.sum(base_feed))
-        atol = max(1e-6, 0.01 * total_feed_sum)  # legacy scaled by TOTAL feed, not max component
-        rtol = 0.0  # legacy behaved like an absolute threshold
-
-        # print diagnostic once
-        print("\n=== MASS BALANCE CHECK ===")
-        print(f"Base feed:          {np.array2string(base_feed, precision=6, suppress_small=True)}")
-        print(f"Added (solvent):    {np.array2string(added, precision=6, suppress_small=True)}")
-        print(f"Effective feed:     {np.array2string(effective_feed, precision=6, suppress_small=True)}")
-        print(f"Total product flow: {np.array2string(total_products, precision=6, suppress_small=True)}")
-        print(f"Difference:         {np.array2string(diff, precision=6, suppress_small=True)} (rtol={rtol}, atol={atol})")
+        atol = max(self.env_config.mb_atol,
+                   self.env_config.mb_relative_percent * total_feed_sum)
+        rtol = self.env_config.mb_rtol
 
         if not np.allclose(total_products, effective_feed, rtol=rtol, atol=atol):
-            raise ValueError(f"Mass balance VIOLATION (severe): diff={diff}, threshold={atol}")
-        else:
-            print("Mass balance OK (atol={}, rtol={})".format(atol, rtol))
+            raise ValueError(
+                f"Mass balance VIOLATION (severe): diff={diff}, threshold={atol}"
+            )
 
     def compute_npv(self):
         """
@@ -897,13 +848,6 @@ class FlowsheetSimulationGraph:
 
         Returns (npv, npv_normed)
         """
-        # If mass balance failed we already raised before; guard anyway
-        # and return a neutral result to avoid cascading errors.
-        try:
-            self._mass_balance_check()
-        except Exception:
-            return None, None
-
         # --- common knobs / helpers ---
         epsilon_for_flowrates = 1e-4
         maxC = self.env_config.max_number_of_components
@@ -1248,20 +1192,7 @@ class FlowsheetSimulationGraph:
     # ----- system data helpers -----
 
     def _collect_current_component_indices(self) -> list[int]:
-        """
-        Return the *global* component indices currently present in the flowsheet,
-        in the order used by the PEQ for this flowsheet.
-        """
-        if hasattr(self, "current_indices") and self.current_indices is not None:
-            return list(self.current_indices)
-
-        # Fallback reconstruction: start from feed situation and add the present solvent if any.
-        idxs = list(self.feed_stream_information["indices_components_in_feeds"])
-        # If already tracking the chosen solvent (global index), include it:
-        if getattr(self, "current_solvent_global_index", None) is not None:
-            if self.current_solvent_global_index not in idxs:
-                idxs.append(self.current_solvent_global_index)
-        return idxs
+        return list(self.current_indices)
 
     def _build_pure_crit_vector(self, indices: list[int]) -> np.ndarray:
         """
