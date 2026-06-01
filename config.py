@@ -16,28 +16,28 @@ class GeneralConfig:
         self.seed = 23
 
         # Network and environment
-        self.latent_dim = 256 #latent dimension for Core transformer 
-        self.num_transformer_blocks = 10 # Number of layers in the stack of transformer blocks for the architecture
+        self.latent_dim = 512 #latent dimension for Core transformer 
+        self.num_transformer_blocks = 5 # Number of layers in the stack of transformer blocks for the architecture
         self.num_heads = 16 # Number of heads in the multihead attention.
         self.dropout = 0. # Dropout for feedforward layer in a transformer block.
         self.num_trf_flow_blocks = 3 #num of transformer blocks for flow expert 
         self.flow_latent_dim = 64
 
         # Loading trained checkpoints to resume training or evaluate
-        self.load_checkpoint_from_path = '/media/raid5/hswt304ash/GumbelFlowsheets/results/results_256_BS_128_100_epoch/best_model.pt'  # If given, model checkpoint is loaded from this path.
+        self.load_checkpoint_from_path = None  # If given, model checkpoint is loaded from this path.
         self.load_optimizer_state = False  # If True, the optimizer state is also loaded.
 
         # Training
         self.num_dataloader_workers = 3  # Number of workers for creating batches for training
-        self.CUDA_VISIBLE_DEVICES = "0,1"  # Must be set, as ray can have problems detecting multiple GPUs
-        self.training_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.num_epochs = 100 # Number of epochs (i.e., passes through training set) to train
-        self.batch_size_training = 32 #Batch size to use for the supervised training during finetuning. 
+        self.CUDA_VISIBLE_DEVICES = "0,1,2,3"  # Must be set, as ray can have problems detecting multiple GPUs
+        self.training_device = "cuda:1"  # Device on which to perform the supervised training
+        self.num_epochs = 1000 # Number of epochs (i.e., passes through training set) to train
+        self.batch_size_training = 64 #Batch size to use for the supervised training during finetuning. 
         self.num_batches_per_epoch = None  # Can be None, then we just do one pass through generated dataset
 
         self.wall_clock_limit = None
         self.mlflow_experiment = 'test'
-
+        self.steps = 10 #how many instances per systems should be generated within the test set
 
         # Optimizer
         self.optimizer = {
@@ -54,14 +54,14 @@ class GeneralConfig:
         self.gumbeldore_config = {
 
             # Number of trajectories with the the highest objective function evaluation to keep for training
-            "num_trajectories_to_keep": 100,
+            "num_trajectories_to_keep": 25, # num_trajectories_to_keep for training PER system 
             "keep_intermediate_trajectories": True,  # if True, we consider all intermediate, terminable trajectories
-            "devices_for_workers": ["cuda:3"] * 1,
+            "devices_for_workers": "cuda:1", #* 1,
             "destination_path": "./data",
             "batch_size_per_worker": 1, 
             "batch_size_per_cpu_worker": 1,
-            "search_type": "beam_search",
-            "beam_width": 64,
+            "search_type": "wor",
+            "beam_width": 32,
             "replan_steps": 12,
             "num_rounds": 1,  # if it's a tuple, then we sample as long as it takes to obtain a better trajectory, but for a minimum of first entry rounds and a maximum of second entry rounds
             "deterministic": False,  # Only use for gumbeldore_eval=True below, switches to regular beam search.
@@ -70,10 +70,12 @@ class GeneralConfig:
         }
 
         # Results and logging
-        '''self.results_path = os.path.join("./results",
+        self.results_path = os.path.join("./results",
                                          datetime.datetime.now().strftime(
-                                             "%Y-%m-%d--%H-%M-%S"))'''  # Path to store the model weights
-        self.results_path = '/media/raid5/hswt304ash/GumbelFlowsheets/results/results_256_BS_128_100_epoch'
+                                             "%Y-%m-%d--%H-%M-%S"))  # Path to store the model weights
+        self.test_path = os.path.join("./test",
+                                         datetime.datetime.now().strftime(
+                                             "%Y-%m-%d--%H-%M-%S"))
         self.log_to_file = True
 
 
@@ -97,10 +99,10 @@ class EnvConfig:
 
         # ----- Phase equilibrium / property data -----
         self.systems_allowed = {
-            "acetone_chloroform": False,
-            "ethanol_water": False,
+            "acetone_chloroform": True,
+            "ethanol_water": True,
             "n-butanol_water": True,
-            "water_pyridine": False
+            "water_pyridine": True
         }
         self.dicretization_parameter_lle = 5       # LLE simplex discretization
         self.curvature_parameter_vle = 0.001       # VLE curvature fitting
@@ -207,7 +209,8 @@ class EnvConfig:
                 break
             
         # Action limits
-        self.max_total_units = 4 # overall cap on placed units (excluding feed)
+        self.max_total_units = 7 # overall cap on placed units (excluding feed)
+        self.min_total_units = 2 
         self.max_distillation_columns = 3
         self.max_decanters = 2
         self.max_split = 1
@@ -241,56 +244,45 @@ class EnvConfig:
         self.add_solvent_comp_map = np.linspace(0.01, 9.99, 100)
 
 
-    # Random feed generator
-    def create_random_problem_instance(self, sampled_index):
-
+    def create_random_problem_instance(self, index):
         """
-        Sample a feed situation of format:
-          [[global indices for feed], [global indices allowed as solvent], number_of_feed_streams]
-        Return:
-          {
-            "feed_situation_index": int,
-            "indices_components_in_feeds": list[int],
-            "list_feed_streams": [np.array(len=max_number_of_components)],
-            "possible_ind_add_comp": list[int],
-            "comp_order_feeds": [names],
-            "lle_for_start": None,
-            "vle_for_start": None
-          }
-          
+        sample a feed situation of format: [[indices from self.names_components for feed],
+        [indices from self.names_components for add_component unit], number of feed streams]
+        and return the situation index, feed streams, restrictions for add component unit and
+        the names and order of the components in the streams
         """
         feed_streams = []
 
-        # sample a feed situation from the PEQ generator
+        # sample a feed situation
         #sampled_index = np.random.randint(len(self.phase_eq_generator.feed_situations))
+        sampled_index = index
         sampled_situation = copy.deepcopy(self.phase_eq_generator.feed_situations[sampled_index])
-        # sampled_situation: [[feed_global_indices], [allowed_add_comp_global_indices], num_streams]
 
-        # optionally shuffle order of components in the feed streams
+        # shuffle order if specified
         if self.shuffle_order_of_components:
             np.random.shuffle(sampled_situation[0])
 
-        # get names for readability
-        names_in_streams = [
-            self.phase_eq_generator.names_components[i] for i in sampled_situation[0]
-        ]
+        # get names in feed streams
+        names_in_streams = []
+        for i in sampled_situation[0]:
+            names_in_streams.append(self.phase_eq_generator.names_components[i])
 
-        # generate the feed stream(s)
-        for _ in range(sampled_situation[-1]):
-            base = np.random.rand(len(sampled_situation[0]))
-            base = base / (sampled_situation[-1] * np.sum(base))  # normalize and split across streams
+        for i in range(sampled_situation[-1]):
+            sampled_flowrates = np.random.rand(len(sampled_situation[0]))
+            # normalize to 1 total flowrate
+            sampled_flowrates = sampled_flowrates / (
+                    sampled_situation[-1] * sum(sampled_flowrates))
 
             stream = np.zeros(self.max_number_of_components)
-            stream[:len(base)] = base
+            stream[:len(sampled_flowrates)] = sampled_flowrates
             feed_streams.append(stream)
 
-        return {
-            "feed_situation_index": sampled_index,
-            "indices_components_in_feeds": sampled_situation[0],
-            "list_feed_streams": feed_streams,
-            "possible_ind_add_comp": sampled_situation[1],
-            "comp_order_feeds": names_in_streams,
-            # placeholders; graph simulator determines current PEQ from indices on-the-fly
-            "lle_for_start": None,
-            "vle_for_start": None
-        }
+        return {"feed_situation_index": sampled_index,
+                "indices_components_in_feeds": sampled_situation[0],
+                "list_feed_streams": feed_streams,
+                "possible_ind_add_comp": sampled_situation[1],
+                "comp_order_feeds": names_in_streams,
+                "lle_for_start": None,
+                "vle_for_start": None}
+
+        

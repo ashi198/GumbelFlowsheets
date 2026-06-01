@@ -151,7 +151,7 @@ def stochastic_beam_search(
             all_states = []  # i-th entry is the parent state of the flattened i-th log_prob/gumbel
             all_child_indices = []
 
-            # MOLECULE EDIT: Always check if we can terminate the resulting state regardless of its probability.
+            # FLOWSHEET EDIT: Always check if we can terminate the resulting state regardless of its probability.
             # If so, we will also collect the corresponding leaf.
             terminable_log_probs = []
             terminable_gumbels = []
@@ -186,9 +186,9 @@ def stochastic_beam_search(
                 all_states.extend([node_state] * len(log_probabilities))  # repeat parent node for as often as needed
                 all_child_indices.extend(good_indices)  # Again, only store feasible actions
 
-                # MOLECULE: Check if we can terminate (and haven't so before) and the molecule is large enough.
+                # MOLECULE: Check if we can terminate (and haven't so before) and the flowsheet is large enough.
                 # If so, register it.
-                if keep_intermediate and type(node_state) is tuple and node_state[1].is_terminable() and 0 in good_indices and node_state[1].total_units_placed >= 5:
+                if keep_intermediate and type(node_state) is tuple and node_state[1].optional_termination() and 0 in good_indices:
                     terminable_log_probs.append(log_probabilities[0])
                     terminable_gumbels.append(gumbels[0])
                     terminable_states.append(node_state)

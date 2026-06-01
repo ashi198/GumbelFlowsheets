@@ -285,10 +285,6 @@ class EdgeFlowExpert(nn.Module):
 
     def forward(self, edge_exists: bool, is_recycle: bool, edge=None, feed_emb = None):
 
-        '''if not edge_exists: 
-            edge_idx = torch.tensor(0, dtype=torch.long, device=self.config.training_device)
-            return self.no_edge_emb(edge_idx)'''
-
         # if an edge exists (in cases of a single open stream or virtual node)
         #edge_idx = torch.tensor(1, dtype=torch.long, device=self.config.training_device)
 
