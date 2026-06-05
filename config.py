@@ -238,7 +238,12 @@ class EnvConfig:
         # List of mappings for params for distillation, split, add_solvent
         self.DF_distillation_map = np.linspace(0.01, 0.99, 100)
         self.split_ratio_map = np.linspace(0.01, 0.99, 100)
-        self.add_solvent_comp_map = np.linspace(0.01, 9.99, 100)
+        _add_solvent_amount_grid = np.linspace(0.01, 9.99, 100)
+
+        self.add_solvent_comp_map = {
+            name: _add_solvent_amount_grid.copy()
+            for name in self.component_names
+        }
 
 
     # Random feed generator
