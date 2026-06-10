@@ -577,8 +577,7 @@ class FlowsheetDesign:
                 return False
             if self.current_state["chosen_open_stream"] is None:
                 return False
-            src_node, _ = self.current_state["chosen_open_stream"]
-            if not self.sim.get_units_with_available_input(exclude=src_node):
+            if len(self._eligible_recycle_destinations()) == 0:
                 return False
 
         return True
@@ -825,17 +824,27 @@ class FlowsheetDesign:
         """
         Return the exact list of destination unit node_ids that are legal for the
         currently chosen open stream:
-          - must be a “single-input” unit per simulator
+          - must have available input capacity per simulator
           - must not be a feed
           - must not be the origin (producer) unit of the chosen stream
+          - if env_config.allow_forward_recycles is False, destination must be
+            upstream/older than the source node, i.e. dest_node_id < origin_node_id
         """
         if self.current_state["chosen_open_stream"] is None:
             return []
-        
+
         origin_node_id = self.current_state["chosen_open_stream"][0]
-        dests = list(self.sim.get_units_with_available_input())  # simulator's base filter
-        # exclude origin and feeds (can't recycle into feed)
-        dests = [nid for nid in dests if nid != origin_node_id and nid not in getattr(self.sim, "feed_nodes", [])]
+        dests = list(self.sim.get_units_with_available_input(exclude=origin_node_id))
+
+        # Cannot recycle into feeds.
+        feed_nodes = set(getattr(self.sim, "feed_nodes", []))
+        dests = [nid for nid in dests if nid not in feed_nodes]
+
+        # Optional true-recycle restriction: block forward pseudo-recycles such as
+        # split out1 -> later unit that was already fed by split out0.
+        if not bool(getattr(self.env_config, "allow_forward_recycles", True)):
+            dests = [nid for nid in dests if nid < origin_node_id]
+
         return dests
 
 

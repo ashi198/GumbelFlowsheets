@@ -132,6 +132,9 @@ class EnvConfig:
         # Choose NPV variant: "generic" (per-mole pricing) or "literature" (per-kg pricing)
         self.npv_version = "literature"  # or "literature"
         self.norm_npv = True  # also compute a normalized NPV
+        self.credit_solvent_product = False  # if False, pure solvent leaving gets no product/performance credit
+        self.enable_cost_debug = False  # keep False for training; set True only in manual/debug scripts
+        self.allow_forward_recycles = False  # if False, recycle destinations must be upstream/lower node id
 
         # Build dynamic price/cost maps that always match the global component list
         names = self.phase_eq_generator.names_components
@@ -238,7 +241,11 @@ class EnvConfig:
         # List of mappings for params for distillation, split, add_solvent
         self.DF_distillation_map = np.linspace(0.01, 0.99, 100)
         self.split_ratio_map = np.linspace(0.01, 0.99, 100)
-        self.add_solvent_comp_map = np.linspace(0.01, 9.99, 100)
+        _amount_grid = np.linspace(0.01, 9.99, 100)
+        self.add_solvent_comp_map = {
+            name: _amount_grid.copy()
+            for name in self.component_names
+        }
 
 
     # Random feed generator
