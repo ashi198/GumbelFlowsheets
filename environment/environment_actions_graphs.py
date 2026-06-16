@@ -134,17 +134,19 @@ class FlowsheetDesign:
         """
         if self.level == 0:
             open_streams = self._enumerate_open_streams()
-            mask = np.zeros(len(open_streams) + 1, dtype=int) #check if this is valid 
+            mask = np.zeros(len(open_streams) + 1, dtype=int)
             
             # masking condition for lvl 0 (terminate)
-            if self.current_state['completed_design'] or self.total_units_placed >= getattr(self.env_config, "max_total_units", 9999) or self._all_units_at_max_capacity() or self.failed_simulator_call >= self.env_config.max_simulator_tries:   
+            if self.forced_termination():   
                 mask[0] = 1
+
+            elif self.optional_termination():
+                mask[:] = 1 #terminate only becomes valid after reaching a minimum num of units placed
             else:
-                mask[1:] = 1 #index 0 for termimate 
+                mask[1:] = 1 #before min units: no terminate 
 
             # enable all available stream slots (everything is available)
-            self.current_action_mask = mask
-            #self.current_state["current_action_mask"] = self.current_action_mask 
+            self.current_action_mask = mask 
             return mask   
 
         # select units now 
@@ -263,19 +265,14 @@ class FlowsheetDesign:
 
         """
 
-        '''assert not self.current_state['completed_design'], "Taking action on an already terminated design!"'''
+        assert not self.current_state['completed_design'], "Taking action on an already terminated design!"
         
-        '''assert self.current_action_mask[action_index] == 0, \
-            f"Trying to take action {action_index} on level {self.level}, but it is set to infeasible"'''
+        assert self.current_action_mask[action_index] == 1, \
+            f"Trying to take action {action_index} on level {self.level}, but it is set to infeasible"
         
         if action_index >= len(self.current_action_mask):
             raise ValueError(f"Invalid action {action_index}, mask size {len(self.current_action_mask)}")
 
-        if self.current_action_mask[action_index] != 1:
-            raise ValueError(
-                f"Action {action_index} is masked at level {self.level} and cannot be taken."
-            )
-        
         try:
             action_index = int(action_index)
             self.current_state['current_level'] = self.level 
@@ -291,8 +288,6 @@ class FlowsheetDesign:
                     self.history.append(action_index)
                     self.identifier = self.generate_custom_flowsheet_id()
 
-                    '''if self.failed_simulator_call >= self.env_config.max_simulator_tries:
-                        return True, -1000, True''' 
                     return True, self.objective, True
 
                 # if not terminate index, then open_stream selected 
@@ -471,8 +466,7 @@ class FlowsheetDesign:
                 if self._chosen_unit_name() == "add_solvent":
                     _, component, _, _ = self.current_state["pending_params"]["add_solvent"].values()
                     if component:
-                        comp_name = self.current_state["pending_params"]["add_solvent"]["name_comp"]
-                        selected_amount = self.env_config.add_solvent_comp_map[comp_name][action_index]
+                        selected_amount = self.env_config.add_solvent_comp_map[action_index]
                         self.current_state["pending_params"]["add_solvent"]["index_for_amount"] = action_index
                         self.current_state["pending_params"]["add_solvent"]["amount_value"] = selected_amount
                         self.history.append(action_index)
@@ -690,6 +684,7 @@ class FlowsheetDesign:
                     params={},
                     num_outputs=1
                 )
+                print('mixer added')
 
             elif unit_name == "recycle":
                 recycle_dest = self.current_state["pending_params"]["recycle"]
@@ -701,6 +696,7 @@ class FlowsheetDesign:
 
                 # Add recycle edge (transactional)
                 self.sim.add_recycle(src_node, src_label, recycle_dest)
+                print('recycler added')
                 created_node_id = None  # no new node
 
             elif unit_name == "add_solvent":
@@ -775,10 +771,6 @@ class FlowsheetDesign:
         self.current_state['npv_raw'] = self.sim.current_net_present_value
         self.current_state['npv_norm'] = self.sim.current_net_present_value_normed 
         reward = self.sim.current_net_present_value_normed #or 0.0
-        #reward = self.sim.current_net_present_value or 0.0
-
-        # reset for next turn
-        #self._reset_action_state()
 
         # termination condition based on max units
         self.current_state['completed_design'] = self.total_units_placed >= getattr(self.env_config, "max_total_units", 9999)
@@ -897,6 +889,7 @@ class FlowsheetDesign:
         """
         Make attention masks for mixer expert unit. 
         0 = not allowed, 1 = allowed 
+        mask: torch.tensor of shape (B, max_nodes, max_nodes)
 
         """
         max_nodes = max(fs.sim.graph.number_of_nodes() for fs in flowsheets)
@@ -936,9 +929,18 @@ class FlowsheetDesign:
             log_probs = np.log(softmax(logits))
 
         return log_probs
+
+    def forced_termination(self):
+        return (self.level == 0 and (self.total_units_placed >= getattr(self.env_config, "max_total_units", 9999)
+        or self._all_units_at_max_capacity() or self.failed_simulator_call >= self.env_config.max_simulator_tries))
+    
+    def optional_termination(self) -> bool:
+        min_units = getattr(self.env_config, "min_total_units", 5)
+        return self.level == 0 and self.total_units_placed >= min_units
+
     
     def is_terminable(self):
-        return self.level == 0 and not self.current_state['completed_design']
+        return self.forced_termination() or self.optional_termination()
     
 
     @staticmethod
@@ -1016,10 +1018,6 @@ class FlowsheetDesign:
                 valid_node_mask[fs_num, 0] = True # virtual node is always valid
                 valid_node_mask[fs_num, id_to_idx[nid] + 1] = True #all other nodes get shifted by +1 
             
-            # fill everything with "no edge"
-            '''no_edge_emb = fs.edge_expert(edge_exists=False, is_recycle=False)
-            edge_embeds[:] = no_edge_emb'''
-
             # now overwrite where real edges exist
             for u, v, key, edge_data in fs.sim.graph.edges(keys= True, data=True):
                 ui = id_to_idx[u]
@@ -1052,7 +1050,7 @@ class FlowsheetDesign:
 
     
     @staticmethod
-    def log_probability_fn(trajectories: List['FlowsheetDesign'], network: nn.Module, device: torch.device, config) -> List[np.array]:
+    def log_probability_fn(trajectories: List['FlowsheetDesign'], network: nn.Module, device: torch.device, config= None) -> List[np.array]:
         
         """
         Given a list of trajectories and a policy network,
@@ -1070,7 +1068,7 @@ class FlowsheetDesign:
         device = torch.device("cpu") if device is None else device
         network.eval()
         with torch.no_grad():
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast(enabled=False, device_type=config.training_device):
                 batch = FlowsheetDesign.list_to_batch(flowsheets=trajectories, device=network.device)
                 lvl_0_logits, unit_predictions = network(batch)
                 padded_open_stream_masks = batch['open_stream_mask']
@@ -1157,8 +1155,8 @@ class FlowsheetDesign:
         """
         instance_list = []
         flowsheet_traj = FlowsheetDesign(random_instance, gen_config, env_config)
-        instance_list.append(flowsheet_traj)
-        return instance_list
+        #instance_list.append(flowsheet_traj)
+        return flowsheet_traj
     
     @staticmethod
     def list_to_batch(flowsheets: List['FlowsheetDesign'], include_feasibility_masks: bool = False, device: torch.device = None) -> dict:

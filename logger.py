@@ -2,6 +2,7 @@ import os
 import inspect
 import json, pickle
 from typing import Optional
+import numpy as np
 
 
 class Logger:
@@ -43,7 +44,42 @@ class Logger:
                 f.write(json.dumps(metrics, default=str))
                 f.write("\n")
 
-    def text_artifact(self, dest_text: str, obj):
-            
-        with open(dest_text, "w") as f:
-            f.write(str(obj))
+    def text_artifact(self, dest_text: str):
+
+        pickle_file_path = f"{dest_text}/test_flowsheets.pickle"
+        final_logger_path = f"{dest_text}/final_test_logger.txt"
+        
+        with open(pickle_file_path, "rb") as f:
+            existing_fs = pickle.load(f)
+        
+        top_k = sorted(existing_fs, key=lambda x: x["obj"], reverse=True)[:20]     
+
+        # Get overall best metrics and flowsheets
+        mean_top_20_obj = np.array([x["obj"] for x in top_k]).mean()
+        top_20_flowsheets = [{x["identifier"]: x["obj"] for x in top_k}]
+        best_gen_obj = top_k[0]["obj"]
+
+        with open(final_logger_path, "w") as f:
+            f.write(f"Mean obj top 20 flowsheets: {mean_top_20_obj}, ")
+            f.write(f"Top 20 flowsheets identifiers: {top_20_flowsheets}, ")
+            f.write(f"Best objective: {best_gen_obj}\n")
+                    
+            for x in top_k:
+                pi = x["problem_instance"]
+                graph = x["graph"]
+                identifier = x["identifier"]
+                f.write(f"identifier: {identifier}, ")
+                f.write(f"situation index: {pi.get('feed_situation_index')}, ")
+                f.write(f"components in feed: {pi.get('indices_components_in_feeds')}, ")
+                f.write(f"feeds: {pi.get('list_feed_streams')}, ")
+                f.write(f"npv_normed: {x.get('obj')}, ")
+                f.write(f"per_ratio: {x.get('per_ratio')}, ")
+                f.write(f"npv_wo_app_cost: {x.get('npv_wo_app_cost')}, ")
+                f.write(f"npv_raw: {x.get('npv_raw')}, ")
+                f.write(f"total_units_placed: {x.get('total_units_placed')}, ")
+                f.write("units:\n")
+                for node_idx, node_data in graph._node.items():
+                    f.write(f"  node {node_idx}:\n")
+                    for k, v in node_data.items():
+                        f.write(f"    {k}: {v}\n")
+                f.write("\n\n")
