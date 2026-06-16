@@ -219,8 +219,26 @@ class FlowsheetSimulationGraph:
     def add_recycle(self, from_node: int, output_label: str, to_node: int) -> None:
         """
         Add a recycle edge from an existing node's output stream (still open) to an existing unit node.
-        The destination must NOT be a feed and should have no more than two inputs already (can be changed).
+        The destination must NOT be a feed and should have available input capacity.
+
+        If env_config.allow_forward_recycles is False, only true backward recycles
+        are allowed: to_node must be lower/older than from_node.
         """
+        if from_node not in self.graph:
+            raise ValueError(f"Recycle source node {from_node} does not exist.")
+        if to_node not in self.graph:
+            raise ValueError(f"Recycle destination node {to_node} does not exist.")
+        if to_node in getattr(self, "feed_nodes", []):
+            raise ValueError("Cannot recycle into a feed node.")
+        if to_node == from_node:
+            raise ValueError("Cannot recycle a stream back into its own producing unit.")
+        if not bool(getattr(self.env_config, "allow_forward_recycles", True)):
+            if to_node >= from_node:
+                raise ValueError(
+                    "Forward recycle is disabled: recycle destination node "
+                    f"{to_node} must be lower than source node {from_node}."
+                )
+
         # confirm source stream is still open
         self._consume_open_stream(from_node, output_label)  # checks the stream exists & is open
 
@@ -701,6 +719,98 @@ class FlowsheetSimulationGraph:
 
         return np.maximum(acc, 0.0)
 
+    def _net_fresh_solvent_added(self, factor_mol: float = 1e6):
+        """
+        Compute net fresh solvent makeup from all add_solvent nodes.
+
+        Definition:
+            net fresh solvent added = max(solvent_out - solvent_in, 0)
+
+        This correctly handles recycle into an add_solvent node:
+            target/source solvent = 9
+            recycled solvent entering add_solvent = 1
+            net fresh solvent makeup = 8
+
+        Returns:
+            added_vector_mol:
+                vector in flowsheet order with net fresh solvent added
+            total_added_mol:
+                scalar molar amount of net fresh solvent makeup
+            total_added_kg_per_hr:
+                scalar kg/hr equivalent, using factor_mol
+            by_node:
+                debug dictionary per add_solvent node
+        """
+        num_comp = self.env_config.max_number_of_components
+        enable_cost_debug = bool(
+            getattr(self.env_config, "enable_cost_debug", False)
+        )
+
+        added_vector_mol = np.zeros(num_comp, dtype=float)
+        total_added_mol = 0.0
+        total_added_kg_per_hr = 0.0
+        by_node = {}
+
+        for nid, node_data in self.graph.nodes(data=True):
+            if node_data.get("unit_type") != "add_solvent":
+                continue
+
+            params = node_data.get("params", {}) or {}
+            if "index_new_component" not in params:
+                continue
+
+            solvent_global_index = int(params["index_new_component"])
+
+            if solvent_global_index not in self.current_indices:
+                # This should not happen after a successful simulation, but skip safely.
+                continue
+
+            solvent_fs_index = self.current_indices.index(solvent_global_index)
+
+            out = node_data.get("output_flows", {}).get("out0")
+            if out is None:
+                continue
+
+            inp = self._sum_inbound_streams(nid)
+            out = np.asarray(out, dtype=float)
+
+            input_solvent_mol = float(inp[solvent_fs_index])
+            output_solvent_mol = float(out[solvent_fs_index])
+            net_added_mol = max(output_solvent_mol - input_solvent_mol, 0.0)
+
+            solvent_only_vector = np.zeros(num_comp, dtype=float)
+            solvent_only_vector[solvent_fs_index] = net_added_mol
+
+            net_added_kg_per_hr = float(
+                np.sum(self._convert_mol_flow_to_kg(solvent_only_vector, factor_mol=factor_mol))
+            )
+
+            added_vector_mol[solvent_fs_index] += net_added_mol
+            total_added_mol += net_added_mol
+            total_added_kg_per_hr += net_added_kg_per_hr
+
+            # Always keep the minimal information needed for solvent-cost accounting.
+            # Only attach the heavier diagnostic payload when cost debug is enabled.
+            by_node[nid] = {
+                "solvent_global_index": solvent_global_index,
+                "solvent_fs_index": solvent_fs_index,
+                "net_added_mol": net_added_mol,
+                "net_added_kg_per_hr": net_added_kg_per_hr,
+            }
+
+            if enable_cost_debug:
+                by_node[nid].update({
+                    "requested_solvent_amount": float(params.get("solvent_amount", 0.0)),
+                    "input_solvent_mol": input_solvent_mol,
+                    "output_solvent_mol": output_solvent_mol,
+                    "input_flow": inp.copy(),
+                    "output_flow": out.copy(),
+                })
+
+        self.solvent_makeup_debug = copy.deepcopy(by_node) if enable_cost_debug else None
+
+        return added_vector_mol, total_added_mol, total_added_kg_per_hr, by_node
+
     def _consume_open_stream(self, node_id: int, label: str) -> None:
         """
         Sanity guard: ensure (node,label) exists as an output. We don't hard "close"
@@ -804,22 +914,8 @@ class FlowsheetSimulationGraph:
                 if f is not None:
                     base_feed += np.array(f, dtype=float)
 
-        # sum of all add_solvent node additions (last component)
-        added = np.zeros(num_comp, dtype=float)
-        last_pos = num_comp - 1
-        for nid in self.graph.nodes:
-            if self.graph.nodes[nid].get("unit_type") == "add_solvent":
-                out = self.graph.nodes[nid]["output_flows"].get("out0")
-                if out is None:
-                    continue
-                inp = self._sum_inbound_streams(nid)
-                delta = out - inp
-                # count only positive increment on LAST component as "added"
-                inc = max(delta[last_pos], 0.0)
-                if inc > 0:
-                    e = np.zeros(num_comp, dtype=float)
-                    e[last_pos] = inc
-                    added += e
+        # Net fresh solvent makeup, accounting for recycle into add_solvent nodes.
+        added, _, _, _ = self._net_fresh_solvent_added(factor_mol=1e6)
 
         effective_feed = base_feed + added
 
@@ -843,122 +939,105 @@ class FlowsheetSimulationGraph:
 
     def compute_npv(self):
         """
-        Graph-version of the generic/literature NPV with the same spirit as the
-        original matrix env. Prices and unit costs are taken from EnvConfig.
+        Graph-version of the generic/literature NPV with EnvConfig-driven
+        prices and unit costs.
 
-        Returns (npv, npv_normed)
+        Important accounting rule:
+            credit_solvent_product = False
+                Pure solvent leaving the process is tracked, but it does not
+                receive economic credit and does not improve performance_ratio.
+
+            credit_solvent_product = True
+                Pure solvent leaving the process is treated as useful recovered
+                material, closer to the previous behavior.
+
+        Fresh solvent makeup is always charged. Recycle into add_solvent reduces
+        fresh solvent makeup through _net_fresh_solvent_added().
         """
         # --- common knobs / helpers ---
         epsilon_for_flowrates = 1e-4
         maxC = self.env_config.max_number_of_components
         names = self.env_config.phase_eq_generator.names_components
 
-        # feed components (before any solvent was added)
+        credit_solvent_product = bool(
+            getattr(self.env_config, "credit_solvent_product", False)
+        )
+        enable_cost_debug = bool(
+            getattr(self.env_config, "enable_cost_debug", False)
+        )
+
+        # Feed components before any solvent was added.
         feed_comp_global = list(self.feed_stream_information.get("indices_components_in_feeds", []))
         num_comps_in_feed = len(feed_comp_global)
+        feed_global_indices = set(int(x) for x in feed_comp_global)
 
-        # Where the solvent lives (flowsheet-order index). The solvent is the last slot
-        # once added; if not present yet, this returns None.
+        # Solvent components are the components introduced by add_solvent nodes.
+        solvent_global_indices = set()
+        for _, node_data in self.graph.nodes(data=True):
+            if node_data.get("unit_type") != "add_solvent":
+                continue
+            params = node_data.get("params", {}) or {}
+            if "index_new_component" in params:
+                solvent_global_indices.add(int(params["index_new_component"]))
+
+        # Where the current solvent lives in flowsheet order.
+        # Current environment allows one added solvent, so this is the last active slot.
         def _solvent_fs_index():
-            # flows are always length maxC; active components are self.current_indices (<= maxC)
             if len(self.current_indices) <= num_comps_in_feed:
                 return None
-            # by construction, append solvent to current_indices -> last active slot
             return len(self.current_indices) - 1
 
-        # Gather all open (leaving) streams as (source_node, label, flow ndarray)
+        # Gather all open product/leaving streams.
         def _leaving_streams():
             leaving = []
-            for (nid, lab) in self.get_open_streams():
+            for nid, lab in self.get_open_streams():
                 src_node = self.graph.nodes[nid]
                 flow = src_node.get("output_flows", {}).get(lab, None)
                 if flow is not None:
                     leaving.append((nid, lab, flow))
             return leaving
 
-        # Sum “base feed” (before any add_solvent) and also sum “added solvent” across add_solvent units.
+        # Sum base feed before any add_solvent.
         base_feed_total = np.zeros(maxC, dtype=float)
         for feed_id in getattr(self, "feed_nodes", []):
             f = self.graph.nodes[feed_id].get("output_flows", {}).get("out0")
             if f is not None:
-                base_feed_total = base_feed_total + np.asarray(f, dtype=float)
+                base_feed_total += np.asarray(f, dtype=float)
 
-        # We’ll also need to estimate *how much* solvent was added by all add_solvent units:
-        total_solvent_added = 0.0  # in molar units (flowsheet order: last active slot)
+        # Shared net fresh solvent makeup calculation.
+        (
+            net_solvent_added_vector_mol,
+            net_solvent_added_mol,
+            net_solvent_added_kg_per_hr,
+            solvent_makeup_by_node,
+        ) = self._net_fresh_solvent_added(factor_mol=1e6)
+
         solv_fs_idx = _solvent_fs_index()
 
-        # Helper to get the summed input to a node (all incoming edge flows)
-        def _sum_inputs_to_node(nid: int) -> np.ndarray:
-            acc = np.zeros(maxC, dtype=float)
-            for u, v, k, data in self.graph.in_edges(nid, keys=True, data=True):
-                # For each incoming edge, the flow is stored on the **source** node’s output_flows
-                lab = data.get("output_label")
-                src_node = self.graph.nodes[u]
-                f = src_node.get("output_flows", {}).get(lab)
-                if f is not None:
-                    acc += np.asarray(f, dtype=float)
-            return acc
-
-        # Helper: iterate all unit nodes with their type
         def _unit_nodes():
             for nid, nd in self.graph.nodes(data=True):
                 ut = nd.get("unit_type")
                 if ut and ut != "feed":
                     yield nid, ut, nd
 
-        # --- Branch by NPV version ---
         version = getattr(self.env_config, "npv_version", "generic").lower()
 
-        # Counters shared by some branches
+        # Performance-ratio numerator components.
+        # sum_n_leaving only includes material counted as useful recovered material.
         sum_n_leaving = 0.0
-        sum_n_solvent_added = 0.0
-        #
-        # if version == "legacy":
-        #     # Keep the “feel” but graphified. Constants as in the original.
-        #     solvent_weight = 10.0
-        #     npv = -10.0 * getattr(self, "steps", 0)  # if track steps, else 0
-        #     solvent_added = 0.0
-        #     solvent_released = 0.0
-        #
-        #     # Leaving streams: reward pure non-solvent or pure solvent
-        #     for nid, lab, flow in _leaving_streams():
-        #         tot = float(np.sum(flow))
-        #         if tot <= epsilon_for_flowrates:
-        #             continue
-        #
-        #         rel = np.array(flow[:num_comps_in_feed], dtype=float) / max(tot, 1e-12)
-        #         if rel.size and np.max(rel) > 0.95:
-        #             weight = 10.0
-        #             if np.max(rel) > 0.99:
-        #                 weight = 1000.0
-        #             npv += weight * tot
-        #
-        #         if solv_fs_idx is not None and solv_fs_idx < len(flow):
-        #             y_solv = float(flow[solv_fs_idx]) / max(tot, 1e-12)
-        #             if y_solv > 0.99:
-        #                 solvent_released += solvent_weight * tot
-        #
-        #     # Solvent added: scan add_solvent nodes and compute (output - input) on solvent slot
-        #     for nid, ut, nd in _unit_nodes():
-        #         if ut != "add_solvent":
-        #             continue
-        #         out = nd.get("output_flows", {}).get("out0")
-        #         if out is None:
-        #             continue
-        #         inp = _sum_inputs_to_node(nid)
-        #         diff = np.maximum(0.0, np.asarray(out, dtype=float) - inp)
-        #         if solv_fs_idx is not None and solv_fs_idx < len(diff):
-        #             solvent_added += float(diff[solv_fs_idx])
-        #
-        #     npv = npv - solvent_added * solvent_weight + solvent_released
-        #     normed = None
-        #     return npv, normed
+        sum_n_feed_products_leaving = 0.0
+        sum_n_solvent_leaving = 0.0
+        sum_n_solvent_credited = 0.0
+        sum_n_solvent_credit_blocked = 0.0
+
+        # Performance-ratio denominator.
+        sum_n_solvent_added = net_solvent_added_mol
 
         if version == "generic":
-            # Use env_config-driven costs
             unit_costs = getattr(self.env_config, "unit_costs_generic", {}) or {}
             product_price = getattr(self.env_config, "product_price_per_component", {}) or {}
             solvent_cost_per_mol = getattr(self.env_config, "solvent_cost_per_component_mol", {}) or {}
+
             specification_pure = 0.99
             specification_solvent = 0.99
             weight_pure_component = 1000.0
@@ -968,144 +1047,202 @@ class FlowsheetSimulationGraph:
             cost_units = 0.0
             cost_solvent_added = 0.0
             gain_solvent_released = 0.0
+            gain_solvent_blocked = 0.0
 
-            # Leaving streams
+            # Debug kg terms for parity with literature branch.
+            kg_solvent_released_per_hr = 0.0
+            kg_solvent_credited_per_hr = 0.0
+            kg_solvent_credit_blocked_per_hr = 0.0
+
+            # Leaving streams.
             for nid, lab, flow in _leaving_streams():
+                flow = np.asarray(flow, dtype=float)
                 tot = float(np.sum(flow))
                 if tot <= epsilon_for_flowrates:
                     continue
-                y = np.asarray(flow, dtype=float) / max(tot, 1e-12)
 
-                # “pure” non-solvent products
-                rel = y[:num_comps_in_feed]
-                if rel.size and np.max(rel) > specification_pure:
-                    # Use a “value” – either generic weight or per-component “product_price_per_component”
-                    # Emulate the legacy’s weight with a component-weighted value.
-                    j_best = int(np.argmax(rel))
+                y = flow / max(tot, 1e-12)
+
+                # Pure feed-component product.
+                rel_feed = y[:num_comps_in_feed]
+                if rel_feed.size and float(np.max(rel_feed)) > specification_pure:
+                    j_best = int(np.argmax(rel_feed))
                     best_global = self.current_indices[j_best] if j_best < len(self.current_indices) else None
-                    price = product_price.get(best_global, weight_pure_component)
-                    gain_leaving_stream += price * tot * float(np.max(rel))
+                    price = float(product_price.get(best_global, weight_pure_component))
+                    purity = float(np.max(rel_feed))
+
+                    gain_leaving_stream += price * tot * purity
+                    sum_n_feed_products_leaving += tot
                     sum_n_leaving += tot
 
-                # pure solvent recovery (if present)
+                # Pure solvent outlet.
                 if solv_fs_idx is not None and solv_fs_idx < len(y):
                     y_solv = float(y[solv_fs_idx])
                     if y_solv > specification_solvent:
-                        g = weight_solvent * tot * y_solv
-                        # mirror legacy “gain”
-                        gain_solvent_released += g
-                        sum_n_leaving += tot
+                        solvent_mol = tot * y_solv
+                        solvent_kg = float(
+                            np.sum(self._convert_mol_flow_to_kg(
+                                np.eye(1, maxC, solv_fs_idx, dtype=float).ravel() * solvent_mol,
+                                factor_mol=1e6,
+                            ))
+                        )
 
-            # Units + solvent added
-            for nid, ut, nd in _unit_nodes():
-                # capital cost
+                        sum_n_solvent_leaving += tot
+                        kg_solvent_released_per_hr += solvent_kg
+
+                        g = weight_solvent * solvent_mol
+                        if credit_solvent_product:
+                            gain_solvent_released += g
+                            sum_n_solvent_credited += tot
+                            sum_n_leaving += tot
+                            kg_solvent_credited_per_hr += solvent_kg
+                        else:
+                            gain_solvent_blocked += g
+                            sum_n_solvent_credit_blocked += tot
+                            kg_solvent_credit_blocked_per_hr += solvent_kg
+
+            # Unit capital costs.
+            for _, ut, _ in _unit_nodes():
                 cost_units += float(unit_costs.get(ut, 0.0))
 
-                if ut == "add_solvent":
-                    out = nd.get("output_flows", {}).get("out0")
-                    if out is None:
-                        continue
-                    inp = _sum_inputs_to_node(nid)
-                    diff = np.maximum(0.0, np.asarray(out, dtype=float) - inp)
-                    if solv_fs_idx is not None and solv_fs_idx < len(diff):
-                        added = float(diff[solv_fs_idx])
-                        sum_n_solvent_added += added
-                        # component index in GLOBAL space:
-                        if solv_fs_idx < len(self.current_indices):
-                            gidx = self.current_indices[solv_fs_idx]
-                            mol_cost = float(solvent_cost_per_mol.get(gidx, 0.0))
-                        else:
-                            mol_cost = 0.0
-                        cost_solvent_added += mol_cost * added
+            # Fresh solvent makeup cost.
+            for info in solvent_makeup_by_node.values():
+                gidx = int(info["solvent_global_index"])
+                added_mol = float(info["net_added_mol"])
+                mol_cost = float(solvent_cost_per_mol.get(gidx, 0.0))
+                cost_solvent_added += mol_cost * added_mol
 
-            # performance ratio
+            # Performance ratio.
             sum_n_feed = float(np.sum(base_feed_total))
             self.performance_ratio = sum_n_leaving / max(sum_n_feed + sum_n_solvent_added, 1e-12)
 
-            # assemble NPV
+            # Assemble NPV.
             npv = 0.0
             self.npv_without_app_cost = 0.0
+
             npv += gain_leaving_stream
             self.npv_without_app_cost += gain_leaving_stream
+
             npv += gain_solvent_released - cost_solvent_added
-            self.npv_without_app_cost += (gain_solvent_released - cost_solvent_added)
+            self.npv_without_app_cost += gain_solvent_released - cost_solvent_added
+
             npv -= cost_units
 
-            # crude normalization like legacy (cap at >=0)
             normed = max(0.0, npv) / 1000.0
+
+            if enable_cost_debug:
+                self.cost_debug = {
+                    "version": version,
+                    "credit_solvent_product": credit_solvent_product,
+                    "feed_global_indices": sorted(feed_global_indices),
+                    "solvent_global_indices": sorted(solvent_global_indices),
+
+                    "sum_n_feed": sum_n_feed,
+                    "sum_n_leaving": sum_n_leaving,
+                    "sum_n_feed_products_leaving": sum_n_feed_products_leaving,
+                    "sum_n_solvent_leaving": sum_n_solvent_leaving,
+                    "sum_n_solvent_credited": sum_n_solvent_credited,
+                    "sum_n_solvent_credit_blocked": sum_n_solvent_credit_blocked,
+                    "sum_n_solvent_added": sum_n_solvent_added,
+                    "performance_ratio_denominator": sum_n_feed + sum_n_solvent_added,
+                    "performance_ratio": self.performance_ratio,
+
+                    "net_solvent_added_vector_mol": net_solvent_added_vector_mol.copy(),
+                    "net_solvent_added_mol": net_solvent_added_mol,
+                    "net_solvent_added_kg_per_hr": net_solvent_added_kg_per_hr,
+                    "solvent_makeup_by_node": copy.deepcopy(solvent_makeup_by_node),
+
+                    "kg_solvent_released_per_hr": kg_solvent_released_per_hr,
+                    "kg_solvent_credited_per_hr": kg_solvent_credited_per_hr,
+                    "kg_solvent_credit_blocked_per_hr": kg_solvent_credit_blocked_per_hr,
+
+                    "gain_leaving_stream": gain_leaving_stream,
+                    "gain_solvent_released": gain_solvent_released,
+                    "gain_solvent_blocked": gain_solvent_blocked,
+                    "cost_solvent_added": cost_solvent_added,
+                    "cost_units": cost_units,
+                    "npv": npv,
+                    "npv_normed": normed,
+                }
+            else:
+                self.cost_debug = None
+
             return npv, normed
 
         else:  # "literature"
-            # 10y horizon @ 8000 h/a, with env_config-read costs
             years = 10
             hr_per_year = 8000
 
             unit_costs = getattr(self.env_config, "unit_costs_literature", {}) or {}
             price_pure_component_per_kg = float(getattr(self.env_config, "lit_product_value_per_kg", 0.5))
             solvent_cost_per_kg = getattr(self.env_config, "solvent_cost_per_component_kg", {}) or {}
+
             specification_pure = 0.99
             specification_solvent = 0.99
 
             gain_leaving_stream = 0.0
             cost_units_total = 0.0
-            kg_solvent_added_per_hr = 0.0
-            kg_solvent_released_per_hr = 0.0
 
-            # Leaving streams: compute in kg/hr for value calc
+            kg_solvent_added_per_hr = net_solvent_added_kg_per_hr
+            kg_solvent_released_per_hr = 0.0
+            kg_solvent_credited_per_hr = 0.0
+            kg_solvent_credit_blocked_per_hr = 0.0
+
+            # Leaving streams: compute economic terms on mass basis.
             for nid, lab, flow in _leaving_streams():
+                flow = np.asarray(flow, dtype=float)
                 tot = float(np.sum(flow))
                 if tot <= epsilon_for_flowrates:
                     continue
 
-                # molar flow vector -> kg/hr (legacy uses factor_mol=1e6, i.e., Mmol/hr system;
-                # if flows are already “per hr” proportions, the scale cancels in normalization)
                 flow_kg = self._convert_mol_flow_to_kg(flow, factor_mol=1e6)
                 mass_total = float(np.sum(flow_kg))
                 if mass_total <= 0.0:
                     continue
-                mass_frac = np.asarray(flow_kg, dtype=float) / max(mass_total, 1e-12)
 
-                # value from (near) pure non-solvent
-                rel_mass = mass_frac[:num_comps_in_feed]
-                if rel_mass.size and np.max(rel_mass) > specification_pure:
-                    gain_leaving_stream += price_pure_component_per_kg * mass_total * float(
-                        np.max(rel_mass)) * years * hr_per_year
+                mass_frac = flow_kg / max(mass_total, 1e-12)
+
+                # Pure feed-component product.
+                rel_mass_feed = mass_frac[:num_comps_in_feed]
+                if rel_mass_feed.size and float(np.max(rel_mass_feed)) > specification_pure:
+                    purity = float(np.max(rel_mass_feed))
+                    gain_leaving_stream += (
+                        price_pure_component_per_kg
+                        * mass_total
+                        * purity
+                        * years
+                        * hr_per_year
+                    )
+                    sum_n_feed_products_leaving += tot
                     sum_n_leaving += tot
 
-                # near-pure solvent recovery
+                # Pure solvent outlet.
                 if solv_fs_idx is not None and solv_fs_idx < len(mass_frac):
                     y_solv_m = float(mass_frac[solv_fs_idx])
                     if y_solv_m > specification_solvent:
-                        kg_solvent_released_per_hr += mass_total * y_solv_m
-                        sum_n_leaving += tot
+                        solvent_kg_per_hr = mass_total * y_solv_m
 
-            # Units, capex/opex, solvent added
+                        kg_solvent_released_per_hr += solvent_kg_per_hr
+                        sum_n_solvent_leaving += tot
+
+                        if credit_solvent_product:
+                            kg_solvent_credited_per_hr += solvent_kg_per_hr
+                            sum_n_solvent_credited += tot
+                            sum_n_leaving += tot
+                        else:
+                            kg_solvent_credit_blocked_per_hr += solvent_kg_per_hr
+                            sum_n_solvent_credit_blocked += tot
+
+            # Unit capex/opex.
             for nid, ut, nd in _unit_nodes():
-                # capital cost (env_config-driven, static)
                 cap = float(unit_costs.get(ut, 0.0))
-                inp_mol = _sum_inputs_to_node(nid)
-                inp_kg = np.sum(self._convert_mol_flow_to_kg(inp_mol, factor_mol=1e6))
+
+                inp_mol = self._sum_inbound_streams(nid)
+                inp_kg = float(np.sum(self._convert_mol_flow_to_kg(inp_mol, factor_mol=1e6)))
                 if inp_kg > epsilon_for_flowrates:
-                    cap *= np.power(inp_kg / 25000.0, 0.6)  # legacy 6/10 rule
+                    cap *= np.power(inp_kg / 25000.0, 0.6)  # 6/10 rule
                 cost_units_total += cap
 
-                if ut == "add_solvent":
-                    out = nd.get("output_flows", {}).get("out0")
-                    if out is None:
-                        continue
-                    inp = _sum_inputs_to_node(nid)
-                    diff = np.maximum(0.0, np.asarray(out, dtype=float) - inp)
-                    if solv_fs_idx is not None and solv_fs_idx < len(diff):
-                        added_mol = float(diff[solv_fs_idx])
-                        # kg/hr of just the solvent component
-                        solvent_molar = np.zeros(maxC, dtype=float)
-                        if solv_fs_idx < maxC:
-                            solvent_molar[solv_fs_idx] = added_mol
-                        solvent_kg_total_flowrate = float(
-                            np.sum(self._convert_mol_flow_to_kg(solvent_molar, factor_mol=1e6)))
-                        kg_solvent_added_per_hr += solvent_kg_total_flowrate
-
-                # simple operating cost example for distillation (optional):
                 if ut == "distillation_column":
                     out0 = nd.get("output_flows", {}).get("out0")
                     if out0 is not None:
@@ -1115,57 +1252,112 @@ class FlowsheetSimulationGraph:
                                 break
                             name = names[gidx]
                             factor = float(
-                                self.env_config.dict_pure_component_data[name].get("factor_heat_estimation_J_per_mol", 0.0))
-                            heat_per_hr += 2.0 * factor * float(out0[j]) * 1e6  # “2x as in legacy”, Mmol->mol
-                        # Convert heat proxy to “steam kg” via water factor, then € via a notional price if available
+                                self.env_config.dict_pure_component_data[name].get(
+                                    "factor_heat_estimation_J_per_mol", 0.0
+                                )
+                            )
+                            heat_per_hr += 2.0 * factor * float(out0[j]) * 1e6
+
                         wfac = float(
-                            self.env_config.dict_pure_component_data["water"].get("factor_heat_estimation_J_per_mol", 0.0))
+                            self.env_config.dict_pure_component_data["water"].get(
+                                "factor_heat_estimation_J_per_mol", 0.0
+                            )
+                        )
                         if wfac > 0:
                             mol_water_per_hr = heat_per_hr / wfac
-                            kg_water_per_hr = mol_water_per_hr * float(
-                                self.env_config.dict_pure_component_data["water"]["M"]) / 1000.0
+                            kg_water_per_hr = (
+                                mol_water_per_hr
+                                * float(self.env_config.dict_pure_component_data["water"]["M"])
+                                / 1000.0
+                            )
                             steam_price = float(unit_costs.get("steam_cost_per_kg", 0.0))
                             cost_units_total += steam_price * kg_water_per_hr * years * hr_per_year
 
-            # performance ratio
-            sum_n_feed = float(np.sum(base_feed_total))
-            self.performance_ratio = sum_n_leaving / max(sum_n_feed + sum_n_solvent_added, 1e-12)
-
-            # aggregate NPV (10y horizon for solvent costs, like legacy)
-            # Convert “kg/hr solvent added/released” to € with component-specific cost if available
-            # Get the global index of the solvent:
+            # Solvent price/cost basis.
             if solv_fs_idx is not None and solv_fs_idx < len(self.current_indices):
                 solv_g = self.current_indices[solv_fs_idx]
                 solv_price_kg = float(solvent_cost_per_kg.get(solv_g, 0.0))
             else:
+                solv_g = None
                 solv_price_kg = 0.0
 
-            npv = 0.0
+            solvent_credit_minus_cost = (
+                kg_solvent_credited_per_hr - kg_solvent_added_per_hr
+            ) * solv_price_kg * years * hr_per_year
+
+            # Aggregate NPV.
+            npv_unscaled = 0.0
             self.npv_without_app_cost = 0.0
 
-            npv += gain_leaving_stream
+            npv_unscaled += gain_leaving_stream
             self.npv_without_app_cost += gain_leaving_stream
 
-            npv += (kg_solvent_released_per_hr - kg_solvent_added_per_hr) * solv_price_kg * years * hr_per_year
-            self.npv_without_app_cost += (
-                                                     kg_solvent_released_per_hr - kg_solvent_added_per_hr) * solv_price_kg * years * hr_per_year
+            npv_unscaled += solvent_credit_minus_cost
+            self.npv_without_app_cost += solvent_credit_minus_cost
 
-            npv -= cost_units_total
+            npv_unscaled -= cost_units_total
 
-            # theoretical max NPV for normalization (all feed sold as pure product)
+            # Theoretical max NPV for normalization: all feed sold as pure product.
             theoretical_max_npv = 0.0
             for feed_id in getattr(self, "feed_nodes", []):
                 f = self.graph.nodes[feed_id].get("output_flows", {}).get("out0")
                 if f is None:
                     continue
                 kg = self._convert_mol_flow_to_kg(f, factor_mol=1e6)
-                theoretical_max_npv += price_pure_component_per_kg * float(np.sum(kg)) * years * hr_per_year
+                theoretical_max_npv += (
+                    price_pure_component_per_kg
+                    * float(np.sum(kg))
+                    * years
+                    * hr_per_year
+                )
 
-            normed = (max(npv, 0.0) / theoretical_max_npv) if theoretical_max_npv > 0 else 0.0
+            normed = (max(npv_unscaled, 0.0) / theoretical_max_npv) if theoretical_max_npv > 0 else 0.0
 
-            # scale to “M€”:
-            npv /= 1000000.0
+            # Scale raw NPV and npv_without_app_cost to M€.
+            npv = npv_unscaled / 1000000.0
             self.npv_without_app_cost /= 1000000.0
+
+            # Performance ratio.
+            sum_n_feed = float(np.sum(base_feed_total))
+            self.performance_ratio = sum_n_leaving / max(sum_n_feed + sum_n_solvent_added, 1e-12)
+
+            if enable_cost_debug:
+                self.cost_debug = {
+                    "version": version,
+                    "credit_solvent_product": credit_solvent_product,
+                    "feed_global_indices": sorted(feed_global_indices),
+                    "solvent_global_indices": sorted(solvent_global_indices),
+                    "solvent_global_index_used_for_price": solv_g,
+
+                    "sum_n_feed": sum_n_feed,
+                    "sum_n_leaving": sum_n_leaving,
+                    "sum_n_feed_products_leaving": sum_n_feed_products_leaving,
+                    "sum_n_solvent_leaving": sum_n_solvent_leaving,
+                    "sum_n_solvent_credited": sum_n_solvent_credited,
+                    "sum_n_solvent_credit_blocked": sum_n_solvent_credit_blocked,
+                    "sum_n_solvent_added": sum_n_solvent_added,
+                    "performance_ratio_denominator": sum_n_feed + sum_n_solvent_added,
+                    "performance_ratio": self.performance_ratio,
+
+                    "net_solvent_added_vector_mol": net_solvent_added_vector_mol.copy(),
+                    "net_solvent_added_mol": net_solvent_added_mol,
+                    "net_solvent_added_kg_per_hr": net_solvent_added_kg_per_hr,
+                    "solvent_makeup_by_node": copy.deepcopy(solvent_makeup_by_node),
+
+                    "kg_solvent_added_per_hr": kg_solvent_added_per_hr,
+                    "kg_solvent_released_per_hr": kg_solvent_released_per_hr,
+                    "kg_solvent_credited_per_hr": kg_solvent_credited_per_hr,
+                    "kg_solvent_credit_blocked_per_hr": kg_solvent_credit_blocked_per_hr,
+
+                    "gain_leaving_stream": gain_leaving_stream,
+                    "solvent_credit_minus_cost": solvent_credit_minus_cost,
+                    "cost_units_total": cost_units_total,
+                    "npv_unscaled": npv_unscaled,
+                    "npv": npv,
+                    "npv_normed": normed,
+                }
+            else:
+                self.cost_debug = None
 
             return npv, normed
 
