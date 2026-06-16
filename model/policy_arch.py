@@ -43,7 +43,7 @@ class FlowsheetNetwork(nn.Module):
 
     def forward(self, x):
         
-        # All nodes and edges already in latent space and batched per flowsheet (N = all nodes within the graph, d= latent_dim, K= num of open stream)
+        # All nodes and edges already in latent space and batched per flowsheet (N = max num of nodes, d= latent_dim, K= num of open stream)
         batch_latent_nodes_embed = x["batch_latent_nodes_embeds"] # (B, N, d) 
         batch_latent_edges_embed = x["batch_latent_edges_embeds"] # (B, N + 1, N + 1, d)
         valid_nodes = x["valid_nodes"] # for padding for additive attention

@@ -1,6 +1,10 @@
 import os, mlflow 
 import numpy as np 
 import torch
+import pickle
+import copy
+from collections import defaultdict
+import random
 
 
 def set_mlflow_connection():
@@ -119,3 +123,278 @@ def build_logit_tensors_per_level(dataset, input_data, terminate_or_open_streams
     return all_lvl_zero_logits, all_lvl_one_logits, all_lvl_two_logits, all_lvl_three_logits
     
 
+def generate_test_sets(num, config, env_config, path):
+    # generate and store test sets for arena, eval etc
+    # we do this always for the same seed
+    np.random.seed(config.seed)
+
+    train_instances = []
+    test_instances = []
+
+    # for some situations, we want to test the agent on feeds provided by literature (of
+    # course only if these are considered in this training process):
+    # Acetone Chloroform: equimolar, wang2018
+    # Water Ethanol: equimolar, kunnakorn2013
+    # Butanol Water: 0.4 But, 0.6 W, luyben2008
+    # Water Pyridine: 0.1 P, 0.9 W, chen2015
+
+    steps = config.steps
+    if env_config.systems_allowed["acetone_chloroform"]:
+        temp_train, temp_test = helper_test_set_generation(
+            names=["acetone", "chloroform"], config=env_config, steps=steps,
+            set_feeds=[[np.array([0.5, 0.5, 0])]])
+
+        train_instances = train_instances + temp_train
+        test_instances = test_instances + temp_test
+
+    if env_config.systems_allowed["ethanol_water"]:
+        temp_train, temp_test = helper_test_set_generation(
+            names=["ethanol", "water"], config=env_config, steps=steps,
+            set_feeds=[[np.array([0.5, 0.5, 0])]])
+
+        train_instances = train_instances + temp_train
+        test_instances = test_instances + temp_test
+
+    if env_config.systems_allowed["n-butanol_water"]:
+        temp_train, temp_test = helper_test_set_generation(
+            names=["n-butanol", "water"], config=env_config, steps=steps,
+            set_feeds=[[np.array([0.4, 0.6, 0])]])
+
+        train_instances = train_instances + temp_train
+        test_instances = test_instances + temp_test
+
+    if env_config.systems_allowed["water_pyridine"]:
+        temp_train, temp_test = helper_test_set_generation(
+            names=["water", "pyridine"], config=env_config, steps=steps,
+            set_feeds=[[np.array([0.9, 0.1, 0])]])
+
+        train_instances = train_instances + temp_train
+        test_instances = test_instances + temp_test
+
+    # create random problem instances to store
+    indices = [0, 1, 2, 3] * (config.num_epochs - 1)
+    random.shuffle(indices)
+
+    for index in indices:
+        train_instances.append(env_config.create_random_problem_instance(index))
+
+    pickle.dump(train_instances, open(os.path.join(os.getcwd(), path, "train_instances.pickle"), "wb"))
+    pickle.dump(test_instances, open(os.path.join(os.getcwd(), path, "test_instances.pickle"), "wb"))
+
+    return train_instances, test_instances
+
+
+def helper_test_set_generation(names, config, steps, set_feeds=None):
+    train_instances = []
+    test_instances = []
+
+    # set_feeds is a list of lists, containing preset feed stream lists
+    if set_feeds is not None:
+        for feeds in set_feeds:
+            instance = find_sit_create_instance(spec_feeds=feeds,
+                                                names_comps=names,
+                                                config=config)
+
+            train_instances.append(instance)
+            test_instances.append(instance)
+
+    for i in range(steps - 1):
+        instance = find_sit_create_instance(
+            spec_feeds=[np.array([(i + 1) * (1 / steps), 1 - ((i + 1) * (1 / steps)), 0])],
+            names_comps=names,
+            config=config)
+
+        test_instances.append(instance)
+
+    return train_instances, test_instances
+
+
+def find_sit_create_instance(spec_feeds, names_comps, config):
+    for sit_ind in range(len(config.phase_eq_generator.feed_situations)):
+        if len(config.phase_eq_generator.feed_situations[sit_ind][0]) == len(names_comps):
+            all_in = True
+            for name in names_comps:
+                if not config.phase_eq_generator.names_components.index(name) in \
+                       config.phase_eq_generator.feed_situations[sit_ind][0]:
+                    all_in = False
+                    break
+
+            if all_in:
+                index = sit_ind
+                break
+
+    situation = copy.deepcopy(config.phase_eq_generator.feed_situations[index])
+
+    # we do not shuffle in this case
+    # get names in feed streams
+    names_in_streams = []
+    for i in situation[0]:
+        names_in_streams.append(config.phase_eq_generator.names_components[i])
+
+    instance = {"feed_situation_index": index,
+                "indices_components_in_feeds": situation[0],
+                "list_feed_streams": spec_feeds,
+                "possible_ind_add_comp": situation[1],
+                "comp_order_feeds": names_in_streams,
+                "lle_for_start": None,
+                "vle_for_start": None}
+
+    return instance
+
+
+def batch_instances_for_dataset(train_instances):
+    
+    grouped_instances = defaultdict(list)
+        
+    for instance in train_instances:
+        idx = instance["feed_situation_index"]
+        grouped_instances[idx].append(instance)
+
+        # convert to list of batches
+        batches = list(grouped_instances.values())
+
+    for instances in grouped_instances.values():
+        random.shuffle(instances)
+
+    # create balanced batches
+    batches = []
+
+    # number of complete batches possible
+    num_batches = min(len(v) for v in grouped_instances.values())
+
+    feed_indices = sorted(grouped_instances.keys())
+
+    for i in range(num_batches):
+        batch = []
+
+        for idx in feed_indices:
+            batch.append(grouped_instances[idx][i])
+
+        batches.append(batch)
+    
+    return batches
+
+
+def set_seed(seed=0, full_deterministic=False):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        if full_deterministic:
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+            torch.use_deterministic_algorithms(True, warn_only=False)
+            # Enable CuDNN deterministic mode
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+
+def dump_top_flowsheets_txt(merged_fs, results_path, round_idx, if_test):
+    if not if_test: 
+        txt_path = f"{results_path}/top_train_flowsheets.txt"
+    else:
+        txt_path = f"{results_path}/top_test_flowsheets.txt"
+
+    best_per_system = {}
+    for x in merged_fs:
+        index = int(x["problem_instance"]["feed_situation_index"])
+
+        if index not in best_per_system or x["obj"] > best_per_system[index]["obj"]:
+            best_per_system[index] = x
+
+    if not if_test:
+        if round_idx == 0:
+            mode = "w"
+        else:
+            mode = "a"
+    else:
+        mode = "a"
+        round_idx = 'test'
+    
+    with open(txt_path, mode) as f:
+        f.write(f"round: {round_idx}\n\n")
+
+        for index, x in best_per_system.items():
+            pi = x["problem_instance"]
+            graph = x["graph"]
+            identifier = x["identifier"]
+            f.write(f"identifier: {identifier}, ")
+            f.write(f"situation index: {pi.get('feed_situation_index')}, ")
+            f.write(f"components in feed: {pi.get('indices_components_in_feeds')}, ")
+            f.write(f"feeds: {pi.get('list_feed_streams')}, ")
+            f.write(f"npv_normed: {x.get('obj')}, ")
+            f.write(f"per_ratio: {x.get('per_ratio')}, ")
+            f.write(f"npv_wo_app_cost: {x.get('npv_wo_app_cost')}, ")
+            f.write(f"npv_raw: {x.get('npv_raw')}, ")
+            f.write(f"total_units_placed: {x.get('total_units_placed')}, ")
+            f.write("units:\n")
+            for node_idx, node_data in graph._node.items():
+                f.write(f"  node {node_idx}:\n")
+                for k, v in node_data.items():
+                    f.write(f"    {k}: {v}\n")
+            f.write("\n\n")
+
+def process_test_results(problem_instances, results, destination_path, epoch, if_test):
+        
+        """
+        Processes the results from Gumbeldore search and save it to a pickle. Each trajectory will be represented as a dict with the
+        following keys and values
+        "action_seq": List[List[int]] Actions which need to be taken on each index to create the molecule
+        "obj": [float] NPV value
+
+        Then:
+        1. If the dataset already exists at the path where to save, we load it, merge them and take the best from the
+            merged dataset.
+
+        Then returns the following dictionary:
+        - "mean_best_gen_obj": Mean best generated obj. -> over the unmerged best flowsheets generated
+        - "best_gen_obj": Best generated obj. -> Best obj. of the unmerged flowsheets generated
+        - "worst_gen_obj": Worst generated obj. -> Worst obj. of the unmerged flowsheets generated
+        - "mean_top_20_obj": Mean top 20 obj. -> over the merged best flowsheets
+        - "top_20_flowsheets": A list of flowsheets with obj. of the top 20 obj.
+        """
+
+        per_feed_index = {}
+
+        for i, _ in enumerate(problem_instances):
+            per_instances = [] 
+            for flowsheet in results[i]: 
+                if flowsheet.objective > float("-inf"):
+
+                    per_instances.append(dict(
+                        problem_instance = flowsheet.problem_instance,
+                        identifier = flowsheet.identifier, 
+                        action_seq=flowsheet.history,
+                        obj=flowsheet.objective,
+                        graph = flowsheet.sim.graph, 
+                        total_units_placed = flowsheet.total_units_placed,
+                        levels = flowsheet.level_list,
+                        nvp_raw = flowsheet.sim.current_net_present_value,
+                        nvp_normed = flowsheet.sim.current_net_present_value_normed,
+                        per_ratio = flowsheet.sim.performance_ratio,
+                        npv_wo_app_cost = flowsheet.sim.npv_without_app_cost,
+
+                    ))
+            per_feed_index[results[i][0].problem_instance["feed_situation_index"]] = per_instances
+
+        # Now check if there already is a data file, and if so, load it and merge it.
+        if destination_path is not None:
+            destination_full_path = f"{destination_path}/test_flowsheets.pickle"
+            existing_fs = []
+            if os.path.isfile(destination_full_path):
+                with open(destination_full_path, "rb") as f:
+                    existing_fs = pickle.load(f) 
+
+            merged_fs = []
+            for _, instances in per_feed_index.items():
+                # this will select top K flowsheets PER system for training
+                top_k = sorted(instances, key=lambda x: x["obj"], reverse=True)[:10]
+                merged_fs.extend(top_k)
+
+            merged_fs = existing_fs + merged_fs
+            # Pickle the generated data again
+            with open(destination_full_path, "wb") as f:
+                pickle.dump(merged_fs, f)
+        
+        dump_top_flowsheets_txt(merged_fs, destination_path, epoch, if_test)
