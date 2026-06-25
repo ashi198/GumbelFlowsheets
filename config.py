@@ -212,16 +212,6 @@ class EnvConfig:
             if key == "add_solvent":
                 self.add_solvent_start_index = i
                 break
-            
-        # Action limits
-        '''self.max_total_units = 4 # overall cap on placed units (excluding feed)
-        self.min_total_units = 2 
-        self.max_distillation_columns = 2
-        self.max_decanters = 1
-        self.max_split = 0
-        self.max_mixer = 0
-        self.max_recycle = 1
-        self.max_solvent = 1'''
 
         # Action limits
         self.max_total_units = 4 # overall cap on placed units (excluding feed)
