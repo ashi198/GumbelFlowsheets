@@ -133,30 +133,44 @@ class FlowsheetDesign:
 
         """
         if self.level == 0:
+            total_limit_reached = self.total_units_placed >= getattr(self.env_config, "max_total_units", 9999) 
             open_streams = self._enumerate_open_streams()
             mask = np.zeros(len(open_streams) + 1, dtype=int)
             
+            if total_limit_reached:
+                # only recycler add mode
+                for i, stream in enumerate(open_streams):
+                    if self._stream_has_valid_recycle(stream):
+                        mask[i + 1] = 1
+            else:
+                mask[1:] = 1
+
             # masking condition for lvl 0 (terminate)
             if self.forced_termination():   
                 mask[0] = 1
+                mask[1:] = 0
 
             elif self.optional_termination():
-                mask[:] = 1 #terminate only becomes valid after reaching a minimum num of units placed
-            else:
-                mask[1:] = 1 #before min units: no terminate 
+                if total_limit_reached:
+                    mask[0] = 1
+                else:
+                    mask[:] = 1 #terminate only becomes valid after reaching a minimum num of units placed
 
             # enable all available stream slots (everything is available)
+            self.current_state["open_streams"] = open_streams
             self.current_action_mask = mask 
             return mask   
 
         # select units now 
         elif self.level == 1:
             unit_params_mask = np.zeros(self.env_config.num_units, dtype=int)
+            open_streams = self._enumerate_open_streams()
             for idx, unit_name in enumerate(self.env_config.units_map_indices_type):
                 # allow only avail units
                 avail_unit = self._unit_available(unit_name, idx)
-                if unit_name not in ["mixer", "recycle"] and avail_unit:
+                if unit_name not in ["mixer", "recycle"] and avail_unit: 
                     unit_params_mask[idx] = 1
+
                 if unit_name == "mixer" and avail_unit:
                     # need at least 2 open streams
                     if len(self._enumerate_open_streams()) < 2:
@@ -170,12 +184,16 @@ class FlowsheetDesign:
                         else:
                             unit_params_mask[idx] = 1
                 if unit_name == "recycle" and avail_unit:
+                    # need a chosen stream (comes from level 0) and at least one eligible des
 
-                    # need a chosen stream (comes from level 0) and at least one eligible dest
-                    eligible_recycle_destinations = self._eligible_recycle_destinations()
+                    '''eligible_recycle_destinations = self._eligible_recycle_destinations()
+                    self.eligible_recycle_destinations = eligible_recycle_destinations
                     if self.current_state["chosen_open_stream"] is None or len(eligible_recycle_destinations) == 0:
                         continue
                     else:
+                        unit_params_mask[idx] = 1'''
+                    
+                    if self._stream_has_valid_recycle(self.current_state["chosen_open_stream"]) or self._is_pure_solvent_stream(self.current_state["chosen_open_stream"]):
                         unit_params_mask[idx] = 1
 
             self.current_action_mask = unit_params_mask
@@ -196,11 +214,18 @@ class FlowsheetDesign:
                 source_node, _ = self.current_state["chosen_open_stream"]
                 id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
                 params_mask = np.zeros(len(node_ids), dtype=int) 
-                recycle_dests = self._eligible_recycle_destinations()
-                for i in recycle_dests:
-                    if i != source_node:
-                        idx = id_to_idx[i]
-                        params_mask[idx] = 1 
+
+                if self._stream_has_valid_recycle(self.current_state["chosen_open_stream"]):
+                    recycle_dests = self._eligible_recycle_destinations()
+
+                    # restrict pure solvent-containing recycle streams to add_solvent nodes
+                    if self._is_pure_solvent_stream(self.current_state["chosen_open_stream"]) and self.sim.graph.nodes[source_node]["unit_type"] != "add_solvent":
+                        recycle_dests = [nid for nid in recycle_dests if self.sim.graph.nodes[nid]["unit_type"] == "add_solvent"]
+
+                    for i in recycle_dests:
+                        if i != source_node:
+                            idx = id_to_idx[i]
+                            params_mask[idx] = 1
 
             elif chosen_unit_name == "mixer":
                 src_node, _ = self.current_state["chosen_open_stream"]
@@ -287,6 +312,7 @@ class FlowsheetDesign:
                     self.level_list.append(self.level)
                     self.history.append(action_index)
                     self.identifier = self.generate_custom_flowsheet_id()
+                    self.literature_flowsheet_similarity_check()
 
                     return True, self.objective, True
 
@@ -377,8 +403,9 @@ class FlowsheetDesign:
                         self.level_list.append(self.level)
                         done, reward, worked = self._complete_action_place_and_simulate()
                         self.current_state["completed_design"] = done 
-                        self.objective = reward 
+                        self.objective = reward
                         self.current_state['open_streams'] = self._enumerate_open_streams()
+
                         self.level = 0 if next_level == None else next_level
                         self.get_feasible_actions()
                         return done, reward, worked
@@ -466,7 +493,7 @@ class FlowsheetDesign:
                 if self._chosen_unit_name() == "add_solvent":
                     _, component, _, _ = self.current_state["pending_params"]["add_solvent"].values()
                     if component:
-                        selected_amount = self.env_config.add_solvent_comp_map[action_index]
+                        selected_amount = self.env_config.add_solvent_comp_map[component][action_index]
                         self.current_state["pending_params"]["add_solvent"]["index_for_amount"] = action_index
                         self.current_state["pending_params"]["add_solvent"]["amount_value"] = selected_amount
                         self.history.append(action_index)
@@ -533,8 +560,10 @@ class FlowsheetDesign:
     # ------------- internals -------------#
 
     def _unit_available(self, unit_name: str, unit_idx: int) -> bool:
-        if self.total_units_placed >= getattr(self.env_config, "max_total_units", 9999):
-            return False
+
+        if unit_name != 'recycle':
+            if self.total_units_placed >= getattr(self.env_config, "max_total_units", 9999) :
+                return False
 
         cap_map = {
             "distillation_column": self.env_config.max_distillation_columns,
@@ -625,6 +654,47 @@ class FlowsheetDesign:
                 return False
 
         return True
+    
+    def _stream_is_recyclable(self, stream, purity_cutoff=0.90, eps=1e-12):
+        node_id, lab = stream
+        flow = np.asarray(self.sim.graph.nodes[node_id]["output_flows"][lab], dtype=float)
+        total = flow.sum()
+
+        if total <= eps:
+            return False
+
+        y = flow / total
+
+        # if already pure enough, do not recycle it
+        num_comps_in_feed = len(self.problem_instance["indices_components_in_feeds"])
+        if np.max(y[:num_comps_in_feed]) >= purity_cutoff:
+            return False
+        
+        return True and not self._node_already_has_recycle(stream)
+    
+    def _is_pure_solvent_stream(self, stream, eps=1e-12):
+        node_id, lab = stream
+        flow = np.asarray(self.sim.graph.nodes[node_id]["output_flows"][lab], dtype=float)
+        total = flow.sum()
+        if total <= eps:
+            return False
+
+        y = flow / total
+        solvent_idx = 2
+        return y[solvent_idx] >= 0.99
+    
+    def _stream_has_valid_recycle(self, stream) -> bool:
+        dests = self._eligible_recycle_destinations(stream=stream)
+        dests_valid = len(dests) > 0
+        if_recyclable = self._stream_is_recyclable(stream)
+
+        return if_recyclable and dests_valid
+    
+    def _node_already_has_recycle(self, node_id):
+        for u, v, data in self.sim.graph.edges(data=True):
+            if u == node_id and data.get("is_recycle", False):
+                return True
+        return False
 
     def _assert_stream_is_open(self, stream: Tuple[int, str]) -> None:
         opens = set(self._enumerate_open_streams())
@@ -684,19 +754,20 @@ class FlowsheetDesign:
                     params={},
                     num_outputs=1
                 )
-                print('mixer added')
 
             elif unit_name == "recycle":
                 recycle_dest = self.current_state["pending_params"]["recycle"]
                 edge_snap = self.sim.snapshot_edges()
+                feed_nodes = set(getattr(self.sim, "feed_nodes", []))
+                if recycle_dest in feed_nodes:
+                    raise ValueError(f"Cannot recycle into feed node {recycle_dest}")
                 if recycle_dest is None:
                     raise RuntimeError("Recycle requires a destination unit to be chosen.")
                 if recycle_dest == src_node:
                     raise ValueError("Cannot recycle a stream back into its own producing unit.")
-
+                
                 # Add recycle edge (transactional)
                 self.sim.add_recycle(src_node, src_label, recycle_dest)
-                print('recycler added')
                 created_node_id = None  # no new node
 
             elif unit_name == "add_solvent":
@@ -812,7 +883,7 @@ class FlowsheetDesign:
         self.get_feasible_actions()
 
 
-    def _eligible_recycle_destinations(self) -> List[int]:
+    def _eligible_recycle_destinations(self, stream = None) -> List[int]:
         """
         Return the exact list of destination unit node_ids that are legal for the
         currently chosen open stream:
@@ -825,8 +896,9 @@ class FlowsheetDesign:
         if self.current_state["chosen_open_stream"] is None:
             return []
 
-        origin_node_id = self.current_state["chosen_open_stream"][0]
-        dests = list(self.sim.get_units_with_available_input(exclude=origin_node_id))
+        origin_node_id = self.current_state["chosen_open_stream"][0] if stream == None else stream[0] 
+        dests = list(self.sim.get_units_with_available_input(exclude=origin_node_id, max_inputs=2))
+        #print(f"origin node: {origin_node_id}")
 
         # Cannot recycle into feeds.
         feed_nodes = set(getattr(self.sim, "feed_nodes", []))
@@ -835,8 +907,9 @@ class FlowsheetDesign:
         # Optional true-recycle restriction: block forward pseudo-recycles such as
         # split out1 -> later unit that was already fed by split out0.
         if not bool(getattr(self.env_config, "allow_forward_recycles", True)):
-            dests = [nid for nid in dests if nid < origin_node_id]
+            dests = [nid for nid in dests if nid < origin_node_id] 
 
+        #print(f"dests: {dests}")
         return dests
 
 
@@ -931,8 +1004,12 @@ class FlowsheetDesign:
         return log_probs
 
     def forced_termination(self):
-        return (self.level == 0 and (self.total_units_placed >= getattr(self.env_config, "max_total_units", 9999)
-        or self._all_units_at_max_capacity() or self.failed_simulator_call >= self.env_config.max_simulator_tries))
+        unit_budget_full = (self.total_units_placed >= getattr(self.env_config, "max_total_units", 9999))
+        recycle_budget_full = (self.counts["recycle"] >= getattr(self.env_config, "max_recycle", 9999)) 
+        no_capacity_left = self._all_units_at_max_capacity() and recycle_budget_full
+        too_many_failures = (self.failed_simulator_call >= self.env_config.max_simulator_tries)
+
+        return (too_many_failures or no_capacity_left or (unit_budget_full and recycle_budget_full))
     
     def optional_termination(self) -> bool:
         min_units = getattr(self.env_config, "min_total_units", 5)
@@ -1036,6 +1113,47 @@ class FlowsheetDesign:
                 batch_latent_open_streams_embeds = open_stream_embeds,
                 valid_node_mask = valid_node_mask,
                 open_stream_mask = FlowsheetDesign.get_open_stream_mask_padded(flowsheets))
+    
+
+    def literature_flowsheet_match(self, desired_nodes, desired_edges):
+    
+        # same number of nodes
+        if len(self.sim.graph.nodes) != len(desired_nodes):
+            return False
+
+        # check node types
+        for nid, utype in desired_nodes.items():
+            if nid not in self.sim.graph.nodes:
+                return False
+            if self.sim.graph.nodes[nid]["unit_type"] != utype:
+                return False
+
+        # extract edges
+        graph_edges = set()
+        for u, v, data in self.sim.graph.edges(data=True):
+            graph_edges.add(
+                (u, v, data.get("is_recycle", False))
+            )
+
+        edges_match = graph_edges == desired_edges
+        if not edges_match:
+            self.literature_bonus = 0.10
+
+        return edges_match
+    
+
+    def literature_flowsheet_similarity_check(self):
+        self.literature_bonus = 0.0
+        sys_name = self.problem_instance["system_name"]
+        motifs = self.env_config.literature_motifs.get(sys_name, [])
+
+        for motif in motifs:
+            desired_nodes = motif["desired_nodes"]
+            desired_edges = motif["desired_edges"]
+
+            if self.literature_flowsheet_match(desired_nodes, desired_edges):
+                self.literature_bonus = 0.20
+                break
     
     # ---- Implementation of abstract methods from `BaseTrajectory`
     def transition_fn(self, action: int) -> Tuple['BaseTrajectory', bool]:

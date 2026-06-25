@@ -66,7 +66,8 @@ class FlowsheetNetwork(nn.Module):
         latent_nodes_transformed = nodes_out[:, 1:, :] # (B, N, d) 
         
         # Now provide stream embedding to open_stream head to get logits   
-        open_stream_embeds = x["batch_latent_open_streams_embeds"]
+        latent_nodes_for_streams = latent_nodes_transformed.unsqueeze(2).expand(-1, -1, 2, -1) # add extra dimension and duplicate embed
+        open_stream_embeds = x["batch_latent_open_streams_embeds"] + latent_nodes_for_streams
         open_stream_logits = self.open_stream_head(open_stream_embeds).squeeze(-1)
         open_stream_logits = open_stream_logits.masked_fill(~x["open_stream_mask"], -1e9) # mask out all non valid streams from padding
         

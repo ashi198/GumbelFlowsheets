@@ -5,6 +5,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torch.amp import autocast
+import datetime
 
 from logger import Logger
 from flowsheet_dataset import RandomDataset
@@ -41,8 +42,6 @@ def train_for_one_epoch(epoch: int, gen_config, env_config, network: FlowsheetNe
     print("Generated Flowsheets")
     print(f"Mean obj. over fresh best flowsheets: {metrics['mean_best_gen_obj']:.3f}")
     print(f"Best / worst obj. over fresh best flowsheets: {metrics['best_gen_obj']:.3f}, {metrics['worst_gen_obj']:.3f}")
-    print(f"Mean obj. over all time top 20 flowsheets: {metrics['mean_top_20_obj']:.3f}")
-    print(f"All time best flowsheet: {list(metrics['top_20_flowsheets'][0].values())[0]:.3f}")
 
     torch.cuda.empty_cache()
     time.sleep(1)
@@ -141,9 +140,7 @@ def train_for_one_epoch(epoch: int, gen_config, env_config, network: FlowsheetNe
           f"Level 2={accumulated_loss_lvl_two / num_batches:.4f} |" f"Level 3 ={accumulated_loss_lvl_three / num_batches:.4f} |" 
           f"Total loss this round ={accumulated_loss/ num_batches:.4f}")
 
-    top_20_flowsheets = metrics["top_20_flowsheets"]
-    del metrics["top_20_flowsheets"]
-    return metrics, top_20_flowsheets
+    return metrics
 
 def evaluate(eval_type: str, gen_config, env_config, network: FlowsheetNetwork, test_instances: dict, destination_path):
 
@@ -173,9 +170,9 @@ if __name__ == '__main__':
 
     # set up mlflow connection 
     '''set_mlflow_connection() 
-    model_start_time = f'test' + '_' + 'fs_512_bs_5_wor' + '_' + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    model_start_time = f'n-butanol_water' + '_' + 'fs_512_bs_128_wor_restricted' + '_' + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     if gen_config.mlflow_experiment is None:
-        mlflow.set_experiment('test' + '_' + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))                        
+        mlflow.set_experiment('n-butanol_water' + '_' + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))                        
     else:
         mlflow.set_experiment(gen_config.mlflow_experiment)'''
 
@@ -205,6 +202,11 @@ if __name__ == '__main__':
     print(f"Policy network is on device {gen_config.training_device}")
     network.to(network.device)
     network.eval()
+    
+    # generate train and test instances for all four sub-systems 
+    train_instances, test_instances = generate_test_sets(gen_config.num_epochs, gen_config, env_config, gen_config.results_path)
+    batches = batch_instances_for_dataset(gen_config, train_instances)
+
 
     if gen_config.num_epochs > 0:
 
@@ -235,19 +237,15 @@ if __name__ == '__main__':
             print(f"Wall clock limit of training set to {gen_config.wall_clock_limit / 3600} hours")
             start_time_counter = time.perf_counter()
 
-        # generate train and test instances for all four sub-systems 
-        train_instances, test_instances = generate_test_sets(gen_config.num_epochs, gen_config, env_config, gen_config.results_path)
-        batches = batch_instances_for_dataset(train_instances)
-
         #with mlflow.start_run(run_name = model_start_time):
         for epoch in range(gen_config.num_epochs):
             print("------")
             print(f"Generating dataset.")
             network_weights = copy.deepcopy(network.get_weights())
 
-            mlflow.log_params({k: v for k, v in vars(gen_config).items() if isinstance(v, (int, float, str, bool))})
+            #mlflow.log_params({k: v for k, v in vars(gen_config).items() if isinstance(v, (int, float, str, bool))})
 
-            generated_loggable_dict, generated_text_to_save = train_for_one_epoch(
+            generated_loggable_dict = train_for_one_epoch(
                 epoch=epoch, gen_config=gen_config, env_config=env_config, network=network, network_weights=network_weights, optimizer=optimizer, 
                 best_objective=best_validation_metric, train_instances=batches[epoch], destination_path=gen_config.gumbeldore_config['destination_path']
             )
@@ -262,8 +260,8 @@ if __name__ == '__main__':
             save_checkpoint(checkpoint, "last_model.pt", gen_config)
 
             # log metrics per epoch 
-            for key, val in generated_loggable_dict.items():
-                mlflow.log_metric(key, val, step=epoch)
+            '''for key, val in generated_loggable_dict.items():
+                mlflow.log_metric(key, val, step=epoch)'''
 
             if val_metric > best_validation_metric:
                 print(">> Got new best model.")
@@ -289,14 +287,13 @@ if __name__ == '__main__':
               "Evaluating with random model.")
 
     torch.cuda.empty_cache()
-    test_batches = batch_instances_for_dataset(test_instances)
+    test_batches = batch_instances_for_dataset(gen_config, test_instances)
     print(">> TEST")
 
     for num, test_bat in enumerate(test_batches): 
         with torch.no_grad():
             print(f"Processing batch {num}/{len(test_batches)}")
             evaluate('test', gen_config, env_config, network, test_bat, gen_config.results_path)
-
-    logger.text_artifact(gen_config.results_path)
+            
     print("Finished. Shutting down ray.")
     ray.shutdown()

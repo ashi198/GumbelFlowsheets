@@ -172,16 +172,22 @@ def generate_test_sets(num, config, env_config, path):
         test_instances = test_instances + temp_test
 
     # create random problem instances to store
-    indices = [0, 1, 2, 3] * (config.num_epochs - 1)
+    if config.balanced == True:
+        indices = list(set(instance["feed_situation_index"] for instance in train_instances)) * (config.num_epochs - 1)
+    else:
+        indices = list(set(instance["feed_situation_index"] for instance in train_instances)) * (config.num_epochs) * steps
     random.shuffle(indices)
 
     for index in indices:
         train_instances.append(env_config.create_random_problem_instance(index))
+    
+    un_train_instances = unique_instances(train_instances)
+    un_test_instances = unique_instances(test_instances)
 
-    pickle.dump(train_instances, open(os.path.join(os.getcwd(), path, "train_instances.pickle"), "wb"))
-    pickle.dump(test_instances, open(os.path.join(os.getcwd(), path, "test_instances.pickle"), "wb"))
+    pickle.dump(un_train_instances, open(os.path.join(os.getcwd(), path, "train_instances.pickle"), "wb"))
+    pickle.dump(un_test_instances, open(os.path.join(os.getcwd(), path, "test_instances.pickle"), "wb"))
 
-    return train_instances, test_instances
+    return un_train_instances, un_test_instances
 
 
 def helper_test_set_generation(names, config, steps, set_feeds=None):
@@ -242,35 +248,41 @@ def find_sit_create_instance(spec_feeds, names_comps, config):
     return instance
 
 
-def batch_instances_for_dataset(train_instances):
-    
-    grouped_instances = defaultdict(list)
-        
-    for instance in train_instances:
-        idx = instance["feed_situation_index"]
-        grouped_instances[idx].append(instance)
+def batch_instances_for_dataset(config, train_instances):
 
-        # convert to list of batches
-        batches = list(grouped_instances.values())
+    if config.balanced == True:
+        grouped_instances = defaultdict(list)
+            
+        for instance in train_instances:
+            idx = instance["feed_situation_index"]
+            grouped_instances[idx].append(instance)
 
-    for instances in grouped_instances.values():
-        random.shuffle(instances)
+            # convert to list of batches
+            batches = list(grouped_instances.values())
 
-    # create balanced batches
-    batches = []
+        for instances in grouped_instances.values():
+            random.shuffle(instances)
 
-    # number of complete batches possible
-    num_batches = min(len(v) for v in grouped_instances.values())
+        # create balanced batches
+        batches = []
 
-    feed_indices = sorted(grouped_instances.keys())
+        # number of complete batches possible
+        num_batches = min(len(v) for v in grouped_instances.values())
 
-    for i in range(num_batches):
-        batch = []
+        feed_indices = sorted(grouped_instances.keys())
 
-        for idx in feed_indices:
-            batch.append(grouped_instances[idx][i])
+        for i in range(num_batches):
+            batch = []
+            for idx in feed_indices:
+                batch.append(grouped_instances[idx][i])
 
-        batches.append(batch)
+            batches.append(batch)
+    else:
+        batches = []
+        random.shuffle(train_instances)
+        for i in range(0, len(train_instances), config.num_instances_per_batch):
+            batch = train_instances[i:i + config.num_instances_per_batch]
+            batches.append(batch)
     
     return batches
 
@@ -298,7 +310,7 @@ def dump_top_flowsheets_txt(merged_fs, results_path, round_idx, if_test):
 
     best_per_system = {}
     for x in merged_fs:
-        index = int(x["problem_instance"]["feed_situation_index"])
+        index = (x["problem_instance"]["feed_situation_index"], tuple(np.round(x["problem_instance"]["list_feed_streams"][0], 6)))
 
         if index not in best_per_system or x["obj"] > best_per_system[index]["obj"]:
             best_per_system[index] = x
@@ -322,18 +334,46 @@ def dump_top_flowsheets_txt(merged_fs, results_path, round_idx, if_test):
             f.write(f"identifier: {identifier}, ")
             f.write(f"situation index: {pi.get('feed_situation_index')}, ")
             f.write(f"components in feed: {pi.get('indices_components_in_feeds')}, ")
+            f.write(f"obj: {x.get('obj')}, ")
             f.write(f"feeds: {pi.get('list_feed_streams')}, ")
-            f.write(f"npv_normed: {x.get('obj')}, ")
+            f.write(f"npv_normed: {x.get('npv_normed')}, ")
             f.write(f"per_ratio: {x.get('per_ratio')}, ")
+            f.write(f"literature_bonus: {x.get('literature_bonus')}, ")
             f.write(f"npv_wo_app_cost: {x.get('npv_wo_app_cost')}, ")
             f.write(f"npv_raw: {x.get('npv_raw')}, ")
             f.write(f"total_units_placed: {x.get('total_units_placed')}, ")
-            f.write("units:\n")
+            f.write("Nodes:\n")
             for node_idx, node_data in graph._node.items():
-                f.write(f"  node {node_idx}:\n")
+                f.write(f"node {node_idx}:\n")
                 for k, v in node_data.items():
-                    f.write(f"    {k}: {v}\n")
-            f.write("\n\n")
+                    f.write(f"{k}: {v}\n")
+            f.write("\n")
+            f.write("Edges:\n") 
+            for src, dst, key, data in graph.edges(keys=True, data=True): 
+                f.write(f"\nedge {src} -> {dst}\n") 
+                f.write(f" output_label : {data.get('output_label')}, ") 
+                f.write(f" is_recycle : {data.get('is_recycle')}, ") 
+                flow = data.get("stream", {}).get("flow") 
+                if flow is not None: 
+                    f.write(f" flow : {flow.tolist()}") 
+                    f.write("\n\n")
+            f.write("=" * 120 + "\n\n")
+
+def unique_instances(instance_list):
+    unique_instances = []
+    seen = set()
+
+    for instance in instance_list:
+        key = (
+            instance["feed_situation_index"],
+            tuple(np.round(instance["list_feed_streams"][0], 6))
+        )
+
+        if key not in seen:
+            seen.add(key)
+            unique_instances.append(instance)
+    return unique_instances
+
 
 def process_test_results(problem_instances, results, destination_path, epoch, if_test):
         
@@ -370,13 +410,15 @@ def process_test_results(problem_instances, results, destination_path, epoch, if
                         graph = flowsheet.sim.graph, 
                         total_units_placed = flowsheet.total_units_placed,
                         levels = flowsheet.level_list,
-                        nvp_raw = flowsheet.sim.current_net_present_value,
-                        nvp_normed = flowsheet.sim.current_net_present_value_normed,
+                        npv_raw = flowsheet.sim.current_net_present_value,
+                        npv_normed = flowsheet.sim.current_net_present_value_normed,
                         per_ratio = flowsheet.sim.performance_ratio,
                         npv_wo_app_cost = flowsheet.sim.npv_without_app_cost,
 
                     ))
-            per_feed_index[results[i][0].problem_instance["feed_situation_index"]] = per_instances
+                
+                key = (results[i][0].problem_instance["feed_situation_index"], tuple(np.round(results[i][0].problem_instance["list_feed_streams"][0], 6)))
+                per_feed_index[key] = per_instances
 
         # Now check if there already is a data file, and if so, load it and merge it.
         if destination_path is not None:

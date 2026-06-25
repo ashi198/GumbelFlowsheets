@@ -871,7 +871,7 @@ class FlowsheetSimulationGraph:
                     opens.append((nid, lbl))
         return opens
 
-    def get_units_with_available_input(self, exclude: Optional[int] = None) -> list:
+    def get_units_with_available_input(self, exclude: Optional[int] = None, max_inputs: int = None) -> list:
         """
         Return units that currently already have a certain number of inputs (currently 3 (more should be impossible),
         excluding feeds and optionally excluding a particular node_id.
@@ -883,7 +883,7 @@ class FlowsheetSimulationGraph:
                 continue
             if exclude is not None and nid == exclude:
                 continue
-            if self.graph.in_degree(nid) <= 2:
+            if self.graph.in_degree(nid) <= max_inputs:
                 eligible.append(nid)
         return eligible
 

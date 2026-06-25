@@ -127,7 +127,6 @@ class GumbeldoreDataset:
             """
 
             metrics_return = dict()
-            seen = set()
             per_feed_index = {}
             instances = []
 
@@ -143,18 +142,20 @@ class GumbeldoreDataset:
                             graph = flowsheet.sim.graph, 
                             total_units_placed = flowsheet.total_units_placed,
                             levels = flowsheet.level_list,
-                            nvp_raw = flowsheet.sim.current_net_present_value,
-                            nvp_normed = flowsheet.sim.current_net_present_value_normed,
+                            npv_raw = flowsheet.sim.current_net_present_value,
+                            npv_normed = flowsheet.sim.current_net_present_value_normed,
                             per_ratio = flowsheet.sim.performance_ratio,
                             npv_wo_app_cost = flowsheet.sim.npv_without_app_cost,
+                            literature_bonus = flowsheet.literature_bonus
 
                         ))
                 instances.extend(per_instances)
-                per_feed_index[results[i][0].problem_instance["feed_situation_index"]] = per_instances
+                key = (results[i][0].problem_instance["feed_situation_index"], tuple(np.round(results[i][0].problem_instance["list_feed_streams"][0], 6)))
+                per_feed_index[key] = per_instances
 
             # Log metrics
             generated_fs = instances
-            generated_fs = sorted(generated_fs, key=lambda x: x["obj"], reverse=True)[:self.gumbeldore_config["num_trajectories_to_keep"] * 4]
+            generated_fs = sorted(generated_fs, key=lambda x: x["obj"], reverse=True)
             generated_objs = np.array([x["obj"] for x in generated_fs])
             metrics_return["mean_best_gen_obj"] = generated_objs.mean()
             metrics_return["best_gen_obj"] = generated_objs[0]
@@ -163,34 +164,29 @@ class GumbeldoreDataset:
             # Now check if there already is a data file, and if so, load it and merge it.
             if destination_path is not None:
                 destination_full_path = f"{destination_path}/generated_flowsheets.pickle"
-                if os.path.isfile(destination_full_path):
-                    with open(destination_full_path, "rb") as f:
-                        existing_fs = pickle.load(f)  # list of dicts
-                    
-                        for x in existing_fs:
-                            index = x["problem_instance"]["feed_situation_index"]
-                            per_feed_index[index].append(x)
-                        
-                        merged_fs = []
-                        for _, instances in per_feed_index.items():
-                            # this will select top K flowsheets PER system for training
-                            top_k = sorted(instances, key=lambda x: x["obj"], reverse=True)[:self.gumbeldore_config["num_trajectories_to_keep"]]
-                            merged_fs.extend(top_k)
-                else:
-                    merged_fs = instances
-                merged_fs = sorted(merged_fs, key=lambda x: x["obj"], reverse=True)[
-                                    :self.gumbeldore_config["num_trajectories_to_keep"] * 4]
+                destination_full_path_complete = f"{destination_path}/complete_generated_flowsheets.pickle"
+
+                merged_fs = []
+                for _, instances in per_feed_index.items():
+                    # this will select top K flowsheets PER instance for training
+                    top_k = sorted(instances, key=lambda x: x["obj"], reverse=True)[:self.gumbeldore_config["num_trajectories_to_keep"]]
+                    merged_fs.extend(top_k)
                 
                 # Pickle the generated data again
                 with open(destination_full_path, "wb") as f:
                     pickle.dump(merged_fs, f)
-            
-            dump_top_flowsheets_txt(merged_fs, destination_path, epoch, if_test)
-            
-            # Get overall best metrics and flowsheets
-            metrics_return["mean_top_20_obj"] = np.array([x["obj"] for x in merged_fs[:20]]).mean()
-            metrics_return["mean_kept_obj"] = np.array([x["obj"] for x in merged_fs]).mean()
-            metrics_return["top_20_flowsheets"] = [{x["identifier"]: x["obj"] for x in merged_fs[:20]}]
+
+                dump_top_flowsheets_txt(merged_fs, destination_path, epoch, if_test)
+
+                existing_fs = []
+                if os.path.isfile(destination_full_path_complete):
+                    with open(destination_full_path_complete, "rb") as f:
+                        existing_fs = pickle.load(f) 
+
+                merged_fs = existing_fs + merged_fs
+                # Pickle complete data
+                with open(destination_full_path_complete, "wb") as f:
+                    pickle.dump(merged_fs, f)
 
             return metrics_return, destination_full_path
 
@@ -206,9 +202,20 @@ def async_sbs_worker(gen_config, env_config, job_pool: JobPool, network_weights:
     def child_log_probability_fn(trajectories: List[FlowsheetDesign]) -> [np.array]:
         return FlowsheetDesign.log_probability_fn(config = gen_config, trajectories=trajectories, network=network, device=device)
     
-    def batch_leaf_evaluation_fn(trajectories: List[FlowsheetDesign]) -> np.array:
+    '''def batch_leaf_evaluation_fn(trajectories: List[FlowsheetDesign]) -> np.array:
         objs = [traj.objective for traj in trajectories]
-        return objs
+        #per_ratio = [traj.sim.performance_ratio for traj in trajectories]
+        literature_ratio = [traj.literature_bonus for traj in trajectories]
+        return objs + literature_ratio'''
+    
+    def batch_leaf_evaluation_fn(trajectories: List[FlowsheetDesign]) -> np.array:
+        for traj in trajectories:
+            npv = traj.objective 
+            literature_ratio = traj.literature_bonus
+            traj.objective = npv + literature_ratio
+        
+        objs = [traj.objective for traj in trajectories]
+        return objs 
 
     def child_transition_fn(trajectory_action_pairs: List[Tuple[FlowsheetDesign, int]]):
         return [traj.transition_fn(action) for traj, action in trajectory_action_pairs]
