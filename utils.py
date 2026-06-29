@@ -5,7 +5,17 @@ import pickle
 import copy
 from collections import defaultdict
 import random
+import argparse
 
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "1"):
+        return True
+    if v.lower() in ("no", "false", "f", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
 
 def set_mlflow_connection():
     #os.environ["AWS_ACCESS_KEY_ID"] = "minio_id"
@@ -242,6 +252,7 @@ def find_sit_create_instance(spec_feeds, names_comps, config):
                 "list_feed_streams": spec_feeds,
                 "possible_ind_add_comp": situation[1],
                 "comp_order_feeds": names_in_streams,
+                "system_name": "_".join(names_in_streams), 
                 "lle_for_start": None,
                 "vle_for_start": None}
 
@@ -302,11 +313,15 @@ def set_seed(seed=0, full_deterministic=False):
             torch.backends.cudnn.benchmark = False
 
 
-def dump_top_flowsheets_txt(merged_fs, results_path, round_idx, if_test):
+def dump_top_flowsheets_txt(input_fs, results_path, round_idx, if_test):
     if not if_test: 
         txt_path = f"{results_path}/top_train_flowsheets.txt"
+        merged_fs = input_fs
     else:
         txt_path = f"{results_path}/top_test_flowsheets.txt"
+        merged_fs = []
+        for _, instances in input_fs.items():
+            merged_fs.extend(instances)
 
     best_per_system = {}
     for x in merged_fs:
@@ -332,6 +347,7 @@ def dump_top_flowsheets_txt(merged_fs, results_path, round_idx, if_test):
             graph = x["graph"]
             identifier = x["identifier"]
             f.write(f"identifier: {identifier}, ")
+            f.write(f"subsystem: {pi.get('system_name')}, ")
             f.write(f"situation index: {pi.get('feed_situation_index')}, ")
             f.write(f"components in feed: {pi.get('indices_components_in_feeds')}, ")
             f.write(f"obj: {x.get('obj')}, ")
@@ -372,6 +388,8 @@ def unique_instances(instance_list):
         if key not in seen:
             seen.add(key)
             unique_instances.append(instance)
+
+    random.shuffle(unique_instances)
     return unique_instances
 
 
@@ -396,12 +414,12 @@ def process_test_results(problem_instances, results, destination_path, epoch, if
         """
 
         per_feed_index = {}
+        instances = []
 
         for i, _ in enumerate(problem_instances):
             per_instances = [] 
             for flowsheet in results[i]: 
                 if flowsheet.objective > float("-inf"):
-
                     per_instances.append(dict(
                         problem_instance = flowsheet.problem_instance,
                         identifier = flowsheet.identifier, 
@@ -411,18 +429,20 @@ def process_test_results(problem_instances, results, destination_path, epoch, if
                         total_units_placed = flowsheet.total_units_placed,
                         levels = flowsheet.level_list,
                         npv_raw = flowsheet.sim.current_net_present_value,
+                        literature_bonus = flowsheet.literature_bonus,
                         npv_normed = flowsheet.sim.current_net_present_value_normed,
                         per_ratio = flowsheet.sim.performance_ratio,
                         npv_wo_app_cost = flowsheet.sim.npv_without_app_cost,
 
                     ))
-                
-                key = (results[i][0].problem_instance["feed_situation_index"], tuple(np.round(results[i][0].problem_instance["list_feed_streams"][0], 6)))
-                per_feed_index[key] = per_instances
+
+            instances.extend(per_instances)
+            key = (results[i][0].problem_instance["feed_situation_index"], tuple(np.round(results[i][0].problem_instance["list_feed_streams"][0], 6)))
+            per_feed_index[key] = per_instances
 
         # Now check if there already is a data file, and if so, load it and merge it.
         if destination_path is not None:
-            destination_full_path = f"{destination_path}/test_flowsheets.pickle"
+            destination_full_path = f"{destination_path}/generated_test_flowsheets.pickle"
             existing_fs = []
             if os.path.isfile(destination_full_path):
                 with open(destination_full_path, "rb") as f:
@@ -439,4 +459,4 @@ def process_test_results(problem_instances, results, destination_path, epoch, if
             with open(destination_full_path, "wb") as f:
                 pickle.dump(merged_fs, f)
         
-        dump_top_flowsheets_txt(merged_fs, destination_path, epoch, if_test)
+        dump_top_flowsheets_txt(per_feed_index, destination_path, epoch, if_test)

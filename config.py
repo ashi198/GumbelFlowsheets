@@ -12,8 +12,8 @@ class GeneralConfig:
     """
         
 
-    def __init__(self):
-        self.seed = 23
+    def __init__(self, args):
+        self.seed = args.seed
 
         # Network and environment
         self.latent_dim = 512 #latent dimension for Core transformer 
@@ -30,16 +30,16 @@ class GeneralConfig:
         # Training
         self.num_dataloader_workers = 3  # Number of workers for creating batches for training
         self.CUDA_VISIBLE_DEVICES = "0,1,2,3"  # Must be set, as ray can have problems detecting multiple GPUs
-        self.training_device = "cuda:0"  # Device on which to perform the supervised training
-        self.num_epochs = 50 # Number of epochs (i.e., passes through training set) to train
+        self.training_device = args.device  # Device on which to perform the supervised training
+        self.num_epochs = 200 # Number of epochs (i.e., passes through training set) to train
         self.batch_size_training = 64 #Batch size to use for the supervised training during finetuning. 
         self.num_batches_per_epoch = 10  # Can be None, then we just do one pass through generated dataset
 
         self.wall_clock_limit = None
         self.mlflow_experiment = 'test'
-        self.steps = 10 #how many instances per systems should be generated within the test set
-        self.balanced = False 
-        self.num_instances_per_batch = 4
+        self.steps = 40 #how many instances per systems should be generated within the test set
+        self.balanced = False if args.subsystem != 'all' else True
+        self.num_instances_per_batch = 4 
 
         # Optimizer
         self.optimizer = {
@@ -58,12 +58,12 @@ class GeneralConfig:
             # Number of trajectories with the the highest objective function evaluation to keep for training
             "num_trajectories_to_keep": 25, # num_trajectories_to_keep for training PER system 
             "keep_intermediate_trajectories": True,  # if True, we consider all intermediate, terminable trajectories
-            "devices_for_workers": "cuda:0", #* 1,
+            "devices_for_workers": f"{args.device}", #* 1,
             "destination_path": "./data",
             "batch_size_per_worker": 1, 
             "batch_size_per_cpu_worker": 1,
-            "search_type": "tasar",
-            "beam_width": 128,
+            "search_type": "wor",
+            "beam_width": 512,
             "replan_steps": 12,
             "num_rounds": 1,  # if it's a tuple, then we sample as long as it takes to obtain a better trajectory, but for a minimum of first entry rounds and a maximum of second entry rounds
             "deterministic": False,  # Only use for gumbeldore_eval=True below, switches to regular beam search.
@@ -72,12 +72,16 @@ class GeneralConfig:
         }
 
         # Results and logging
-        self.results_path = os.path.join("./results",
+        '''self.results_path = os.path.join("./results",
                                          datetime.datetime.now().strftime(
                                              "%Y-%m-%d--%H-%M-%S"))  # Path to store the model weights
         self.test_path = os.path.join("./test",
                                          datetime.datetime.now().strftime(
-                                             "%Y-%m-%d--%H-%M-%S"))
+                                             "%Y-%m-%d--%H-%M-%S"))'''
+        
+        self.results_path = os.path.join(f"{args.results}", f"{args.subsystem}")
+        os.makedirs(self.results_path, exist_ok=True)
+
         self.log_to_file = True
 
 
@@ -91,7 +95,7 @@ class EnvConfig:
     - Generates random feed problem instances
     """
 
-    def __init__(self):
+    def __init__(self, args):
 
         # ----- Core dimensional settings -----
 
@@ -100,12 +104,19 @@ class EnvConfig:
         self.max_simulator_tries = 30
 
         # ----- Phase equilibrium / property data -----
-        self.systems_allowed = {
-            "acetone_chloroform": False,
-            "ethanol_water": False,
-            "n-butanol_water": False,
-            "water_pyridine": True
-        }
+        all_subsystems = ['acetone_chloroform', 'ethanol_water', 'n-butanol_water', 'water_pyridine']
+        self.systems_allowed = {}
+        for sub in all_subsystems: 
+            self.systems_allowed[sub] = False
+            if sub == args.subsystem or args.subsystem == 'all':
+                self.systems_allowed [sub] = True
+
+        '''self.systems_allowed = {
+        "acetone_chloroform": True,
+        "ethanol_water": False,
+        "n-butanol_water": False,
+        "water_pyridine": False}'''
+        
         self.dicretization_parameter_lle = 5       # LLE simplex discretization
         self.curvature_parameter_vle = 0.001       # VLE curvature fitting
 
@@ -212,26 +223,13 @@ class EnvConfig:
             if key == "add_solvent":
                 self.add_solvent_start_index = i
                 break
-            
-        # Action limits
-        '''self.max_total_units = 4 # overall cap on placed units (excluding feed)
-        self.min_total_units = 2 
-        self.max_distillation_columns = 2
-        self.max_decanters = 1
-        self.max_split = 0
-        self.max_mixer = 0
-        self.max_recycle = 1
-        self.max_solvent = 1'''
 
-        # Action limits
-        self.max_total_units = 4 # overall cap on placed units (excluding feed)
-        self.min_total_units = 4 
-        self.max_distillation_columns = 2
-        self.max_decanters = 1
-        self.max_split = 0
-        self.max_mixer = 0
-        self.max_recycle = 1
-        self.max_solvent = 1
+        # Action limits depending on the subsystem
+        self.action_limits = {'acetone_chloroform': {'max_total_units': 5, 'min_total_units': 4, 'max_distillation_columns': 3, 'max_decanters': 1, 'max_split': 0, 'max_mixer': 0, 'max_recycle': 2, 'max_solvent': 1}, 
+                            'ethanol_water': {'max_total_units': 4, 'min_total_units': 2, 'max_distillation_columns': 2, 'max_decanters': 1, 'max_split': 0, 'max_mixer': 0, 'max_recycle': 1, 'max_solvent': 1},
+                            'n-butanol_water': {'max_total_units': 3, 'min_total_units': 3, 'max_distillation_columns': 2, 'max_decanters': 1, 'max_split': 0, 'max_mixer': 0, 'max_recycle': 2, 'max_solvent': 0}, 
+                            'water_pyridine': {'max_total_units': 4, 'min_total_units': 4, 'max_distillation_columns': 2, 'max_decanters': 1, 'max_split': 0, 'max_mixer': 0, 'max_recycle': 2, 'max_solvent': 1},
+                            'all': {'max_total_units': 5, 'min_total_units': 2, 'max_distillation_columns': 3, 'max_decanters': 1, 'max_split': 0, 'max_mixer': 0, 'max_recycle': 2, 'max_solvent': 1}}
 
         # ----- Recycle solver config -----
         # recycle guesses; see original env for semantics
@@ -276,7 +274,12 @@ class EnvConfig:
                 4: "decanter",}, "desired_edges": {(0, 1, False), (1, 2, False), (2, 3, False), (3, 4, False),(4, 1, True),},},
             {"name": "ethanol_water_dc_dc_recycle", "desired_nodes": {0: "feed", 1: "distillation_column", 2: "distillation_column",},
             "desired_edges": {(0, 1, False), (1, 2, False), (2, 1, True),},},], 
-        "n-butanol_water": [],
+        "n-butanol_water": [
+                        {"name": "n-butanol_water", "desired_nodes": {0: "feed", 1: "decanter", 2: "distillation_column", 3: "distillation_column",}, 
+                         "desired_edges": {(0, 1, False), (1, 2, False), (1, 3, False), (2, 1, True),(3, 1, True),},},
+
+            {"name": "ethanol_water_dc_dc_recycle", "desired_nodes": {0: "feed", 1: "distillation_column", 2: "distillation_column",},
+            "desired_edges": {(0, 1, False), (1, 2, False), (2, 1, True),},},],
         "water_pyridine": [{
             "name": "water_pyridine", 
             "desired_nodes": {0: "feed", 1: "add_solvent", 2: "distillation_column", 3: "decanter", 

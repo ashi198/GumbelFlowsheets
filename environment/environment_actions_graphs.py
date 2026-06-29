@@ -82,6 +82,16 @@ class FlowsheetDesign:
 
         self.current_action_mask: Optional[np.array] = None # The action mask indicates before each action what is feasible at the current level.
 
+        # limits on units 
+        self.max_total_units = self.env_config.action_limits[self.problem_instance['system_name']]['max_total_units'] # overall cap on placed units (excluding feed)
+        self.min_total_units = self.env_config.action_limits[self.problem_instance['system_name']]['min_total_units']
+        self.max_distillation_columns = self.env_config.action_limits[self.problem_instance['system_name']]['max_distillation_columns']
+        self.max_decanters = self.env_config.action_limits[self.problem_instance['system_name']]['max_decanters']
+        self.max_split = 0
+        self.max_mixer = 0
+        self.max_recycle = self.env_config.action_limits[self.problem_instance['system_name']]['max_recycle']
+        self.max_solvent = self.env_config.action_limits[self.problem_instance['system_name']]['max_solvent']
+
         # initial simulate to populate open streams/NPV
         self.sim.simulate()
         self.objective = None        
@@ -109,7 +119,7 @@ class FlowsheetDesign:
             
             "npv_raw": None, #raw values of nvp simulation
             "npv_norm": None, #norm values 
-            "completed_design": None, # True only when termination criteria has been reached
+            "completed_design": None, # True only when termination is selected
             "second_open_stream_dest_node": None, #Optional[int] 
             "second_open_stream": None, #Optional[Tuple[int, str]]
             "recycle_dest_unit": None, #Optional[int]
@@ -133,7 +143,7 @@ class FlowsheetDesign:
 
         """
         if self.level == 0:
-            total_limit_reached = self.total_units_placed >= getattr(self.env_config, "max_total_units", 9999) 
+            total_limit_reached = self.total_units_placed >= getattr(self, "max_total_units", 9999) 
             open_streams = self._enumerate_open_streams()
             mask = np.zeros(len(open_streams) + 1, dtype=int)
             
@@ -217,15 +227,12 @@ class FlowsheetDesign:
 
                 if self._stream_has_valid_recycle(self.current_state["chosen_open_stream"]):
                     recycle_dests = self._eligible_recycle_destinations()
-
-                    # restrict pure solvent-containing recycle streams to add_solvent nodes
-                    if self._is_pure_solvent_stream(self.current_state["chosen_open_stream"]) and self.sim.graph.nodes[source_node]["unit_type"] != "add_solvent":
-                        recycle_dests = [nid for nid in recycle_dests if self.sim.graph.nodes[nid]["unit_type"] == "add_solvent"]
-
                     for i in recycle_dests:
                         if i != source_node:
                             idx = id_to_idx[i]
                             params_mask[idx] = 1
+                    if not np.any(params_mask):
+                        print('goofup here')
 
             elif chosen_unit_name == "mixer":
                 src_node, _ = self.current_state["chosen_open_stream"]
@@ -307,7 +314,7 @@ class FlowsheetDesign:
 
             if self.level == 0:
                 self._action_seq_start = len(self.history)
-                if action_index == 0:  # Check this later 
+                if action_index == 0: 
                     self.current_state['completed_design'] = True 
                     self.level_list.append(self.level)
                     self.history.append(action_index)
@@ -445,6 +452,7 @@ class FlowsheetDesign:
                 elif self._chosen_unit_name() == "recycle":
                     dests = self._eligible_recycle_destinations()
                     node_ids = list(self.sim.graph.nodes)
+
                     id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
                     idx_to_id = {v: k for k, v in id_to_idx.items()}
                     if len(dests) == 0:
@@ -562,16 +570,16 @@ class FlowsheetDesign:
     def _unit_available(self, unit_name: str, unit_idx: int) -> bool:
 
         if unit_name != 'recycle':
-            if self.total_units_placed >= getattr(self.env_config, "max_total_units", 9999) :
+            if self.total_units_placed >= getattr(self, "max_total_units", 9999) :
                 return False
 
         cap_map = {
-            "distillation_column": self.env_config.max_distillation_columns,
-            "decanter": self.env_config.max_decanters,
-            "split": self.env_config.max_split,
-            "mixer": self.env_config.max_mixer,
-            "recycle": self.env_config.max_recycle,
-            "add_solvent": self.env_config.max_solvent,
+            "distillation_column": self.max_distillation_columns,
+            "decanter": self.max_decanters,
+            "split": self.max_split,
+            "mixer": self.max_mixer,
+            "recycle": self.max_recycle,
+            "add_solvent": self.max_solvent,
         }
         if unit_name in cap_map and self.counts[unit_name] >= cap_map[unit_name]:
             return False
@@ -637,12 +645,12 @@ class FlowsheetDesign:
     
     def _all_units_at_max_capacity(self) -> bool:
         cap_map = {
-            "distillation_column": self.env_config.max_distillation_columns,
-            "decanter": self.env_config.max_decanters,
-            "split": self.env_config.max_split,
-            "mixer": self.env_config.max_mixer,
-            "recycle": self.env_config.max_recycle,
-            "add_solvent": self.env_config.max_solvent,
+            "distillation_column": self.max_distillation_columns,
+            "decanter": self.max_decanters,
+            "split": self.max_split,
+            "mixer": self.max_mixer,
+            "recycle": self.max_recycle,
+            "add_solvent": self.max_solvent,
         }
 
         for unit, max_cap in cap_map.items():
@@ -738,6 +746,7 @@ class FlowsheetDesign:
                 params = {
                     "index_new_component": index,
                     "solvent_amount": float(amount_value),
+                    "component_name": component
                 }
 
             snap = self.sim.snapshot(include_phase=(unit_name == "add_solvent"))
@@ -842,9 +851,7 @@ class FlowsheetDesign:
         self.current_state['npv_raw'] = self.sim.current_net_present_value
         self.current_state['npv_norm'] = self.sim.current_net_present_value_normed 
         reward = self.sim.current_net_present_value_normed #or 0.0
-
-        # termination condition based on max units
-        self.current_state['completed_design'] = self.total_units_placed >= getattr(self.env_config, "max_total_units", 9999)
+        
         return False, reward, True
 
     def _rollback_action_history(self):
@@ -908,8 +915,6 @@ class FlowsheetDesign:
         # split out1 -> later unit that was already fed by split out0.
         if not bool(getattr(self.env_config, "allow_forward_recycles", True)):
             dests = [nid for nid in dests if nid < origin_node_id] 
-
-        #print(f"dests: {dests}")
         return dests
 
 
@@ -1004,15 +1009,15 @@ class FlowsheetDesign:
         return log_probs
 
     def forced_termination(self):
-        unit_budget_full = (self.total_units_placed >= getattr(self.env_config, "max_total_units", 9999))
-        recycle_budget_full = (self.counts["recycle"] >= getattr(self.env_config, "max_recycle", 9999)) 
+        unit_budget_full = (self.total_units_placed >= getattr(self, "max_total_units", 9999))
+        recycle_budget_full = (self.counts["recycle"] >= getattr(self, "max_recycle", 9999)) 
         no_capacity_left = self._all_units_at_max_capacity() and recycle_budget_full
         too_many_failures = (self.failed_simulator_call >= self.env_config.max_simulator_tries)
 
-        return (too_many_failures or no_capacity_left or (unit_budget_full and recycle_budget_full))
+        return self.level == 0 and (too_many_failures or no_capacity_left or (unit_budget_full and recycle_budget_full))
     
     def optional_termination(self) -> bool:
-        min_units = getattr(self.env_config, "min_total_units", 5)
+        min_units = getattr(self, "min_total_units", 0)
         return self.level == 0 and self.total_units_placed >= min_units
 
     
@@ -1127,6 +1132,8 @@ class FlowsheetDesign:
                 return False
             if self.sim.graph.nodes[nid]["unit_type"] != utype:
                 return False
+            
+        self.literature_bonus = max(self.literature_bonus, 0.10)
 
         # extract edges
         graph_edges = set()
@@ -1136,8 +1143,6 @@ class FlowsheetDesign:
             )
 
         edges_match = graph_edges == desired_edges
-        if not edges_match:
-            self.literature_bonus = 0.10
 
         return edges_match
     
@@ -1157,9 +1162,38 @@ class FlowsheetDesign:
     
     # ---- Implementation of abstract methods from `BaseTrajectory`
     def transition_fn(self, action: int) -> Tuple['BaseTrajectory', bool]:
+
+        expert_list = self.remove_units_before_deepcopy()
         copied_fs= copy.deepcopy(self)
+
+        self.add_experts_back(expert_list, copied_fs)
         copied_fs.take_action(action, None)
         return copied_fs, copied_fs.current_state["completed_design"]
+    
+    def remove_units_before_deepcopy(self):
+        
+        # Temporarily remove GPU modules before deepcopy
+        unit_experts = self.unit_experts
+        edge_expert = self.edge_expert
+        open_stream_expert = self.open_stream_expert
+
+        self.unit_experts = None
+        self.edge_expert = None
+        self.open_stream_expert = None
+
+        expert_list = [unit_experts, edge_expert, open_stream_expert]
+        return expert_list
+    
+    def add_experts_back(self, expert_list, copied_fs):
+        self.unit_experts = expert_list[0]
+        self.edge_expert = expert_list[1]
+        self.open_stream_expert = expert_list[2]
+
+        # Attach same shared experts to copy, do NOT deepcopy them
+        copied_fs.unit_experts = expert_list[0]
+        copied_fs.edge_expert = expert_list[1]
+        copied_fs.open_stream_expert = expert_list[2]
+
     
     def to_max_evaluation_fn(self) -> float:
         if self.objective is None:

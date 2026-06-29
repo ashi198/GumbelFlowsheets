@@ -8,7 +8,7 @@ handling the case where not all leaves are at the same level of the tree.
 """
 import typing
 from typing import Any, Callable, List, Tuple, Union
-
+import os
 import numpy as np
 
 State = Any  # Type alias. A state corresponds to a single node (i.e., partial trajectory) in the search tree.
@@ -186,9 +186,11 @@ def stochastic_beam_search(
                 all_states.extend([node_state] * len(log_probabilities))  # repeat parent node for as often as needed
                 all_child_indices.extend(good_indices)  # Again, only store feasible actions
 
-                # MOLECULE: Check if we can terminate (and haven't so before) and the flowsheet is large enough.
+                # Check if we can terminate (and haven't so before) and the flowsheet is large enough.
                 # If so, register it.
-                if keep_intermediate and type(node_state) is tuple and node_state[1].optional_termination() and 0 in good_indices:
+                if_terminable = node_state[1].is_terminable()
+
+                if keep_intermediate and type(node_state) is tuple and node_state[1].is_terminable() and 0 in good_indices and node_state[1].level == 0:
                     terminable_log_probs.append(log_probabilities[0])
                     terminable_gumbels.append(gumbels[0])
                     terminable_states.append(node_state)
@@ -255,7 +257,7 @@ def stochastic_beam_search(
                         internal_gumbels.append(gumbel)
                         internal_states.append(child_state)
 
-            # MOLECULE EDIT: Expand the terminable nodes.
+            # Flowsheet EDIT: Expand the terminable nodes.
             if keep_intermediate and len(terminable_states):
                 child_states = child_transition_fn([(x, 0) for x in terminable_states])
                 for log_prob, gumbel, (child_state, is_leaf) in zip(

@@ -22,6 +22,33 @@ os.environ["RAY_DEDUP_LOGS"]="0"
 os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"]="1"
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--subsystem",
+                        type=str,
+                        choices=['acetone_chloroform', 'ethanol_water', 'n-butanol_water', 'water_pyridine', 'all'],
+                        default = 'all',
+                        help="Specify benchmark task.")
+    
+    parser.add_argument("--seed",
+                        type=int,
+                        default=2,
+                        help="Random seed")
+    
+    parser.add_argument("--device",
+                        type=str,
+                        default='cuda:0',
+                        help="device")
+    
+    parser.add_argument("--results",
+                        type=str,
+                        help="specify directory for storing results", 
+                        default="./results/random")
+    
+    args = parser.parse_args()
+    return args
+    
+
 def save_checkpoint(checkpoint: dict, filename: str, gen_config):
     os.makedirs(gen_config.results_path, exist_ok=True)
     path = os.path.join(gen_config.results_path, filename)
@@ -149,16 +176,11 @@ def evaluate(eval_type: str, gen_config, env_config, network: FlowsheetNetwork, 
     gumbeldore_dataset.generate_dataset(copy.deepcopy(network.get_weights()), memory_aggressive=False, 
                                                      if_test = True, epoch=0)
 
-if __name__ == '__main__':
+def main(args):
     print(">> Flowsheet Design using Gumbeldore")
 
-    parser = argparse.ArgumentParser(description='Experiment')
-    parser.add_argument('--config', help="Path to optional config relative to main.py")
-    args = parser.parse_args()
-
-    gen_config = GeneralConfig()
-    env_config = EnvConfig()
-
+    gen_config = GeneralConfig(args)
+    env_config = EnvConfig(args)
 
     os.environ["CUDA_VISIBLE_DEVICES"] = gen_config.CUDA_VISIBLE_DEVICES
     num_gpus = len(gen_config.CUDA_VISIBLE_DEVICES.split(","))
@@ -169,12 +191,12 @@ if __name__ == '__main__':
     logger.log_hyperparams(gen_config)
 
     # set up mlflow connection 
-    '''set_mlflow_connection() 
-    model_start_time = f'n-butanol_water' + '_' + 'fs_512_bs_128_wor_restricted' + '_' + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    set_mlflow_connection() 
+    model_start_time = f'{args.subsystem}' + '_' + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     if gen_config.mlflow_experiment is None:
-        mlflow.set_experiment('n-butanol_water' + '_' + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))                        
+        mlflow.set_experiment(f'{args.subsystem}' + '_' + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))                        
     else:
-        mlflow.set_experiment(gen_config.mlflow_experiment)'''
+        mlflow.set_experiment(gen_config.mlflow_experiment)
 
     # Fix random number generator seed for better reproducibility
     set_seed(gen_config.seed)
@@ -237,43 +259,43 @@ if __name__ == '__main__':
             print(f"Wall clock limit of training set to {gen_config.wall_clock_limit / 3600} hours")
             start_time_counter = time.perf_counter()
 
-        #with mlflow.start_run(run_name = model_start_time):
-        for epoch in range(gen_config.num_epochs):
-            print("------")
-            print(f"Generating dataset.")
-            network_weights = copy.deepcopy(network.get_weights())
+        with mlflow.start_run(run_name = model_start_time):
+            for epoch in range(gen_config.num_epochs):
+                print("------")
+                print(f"Generating dataset.")
+                network_weights = copy.deepcopy(network.get_weights())
 
-            #mlflow.log_params({k: v for k, v in vars(gen_config).items() if isinstance(v, (int, float, str, bool))})
+                mlflow.log_params({k: v for k, v in vars(gen_config).items() if isinstance(v, (int, float, str, bool))})
 
-            generated_loggable_dict = train_for_one_epoch(
-                epoch=epoch, gen_config=gen_config, env_config=env_config, network=network, network_weights=network_weights, optimizer=optimizer, 
-                best_objective=best_validation_metric, train_instances=batches[epoch], destination_path=gen_config.gumbeldore_config['destination_path']
-            )
+                generated_loggable_dict = train_for_one_epoch(
+                    epoch=epoch, gen_config=gen_config, env_config=env_config, network=network, network_weights=network_weights, optimizer=optimizer, 
+                    best_objective=best_validation_metric, train_instances=batches[epoch], destination_path=gen_config.gumbeldore_config['destination_path']
+                )
 
-            # Save model
-            checkpoint["model_weights"] = copy.deepcopy(network.get_weights())
-            checkpoint["optimizer_state"] = copy.deepcopy(
-                dict_to_cpu(optimizer.state_dict())
-            )
-            val_metric = generated_loggable_dict["best_gen_obj"]   # measure by best objective found during sampling
-            checkpoint["validation_metric"] = val_metric
-            save_checkpoint(checkpoint, "last_model.pt", gen_config)
+                # Save model
+                checkpoint["model_weights"] = copy.deepcopy(network.get_weights())
+                checkpoint["optimizer_state"] = copy.deepcopy(
+                    dict_to_cpu(optimizer.state_dict())
+                )
+                val_metric = generated_loggable_dict["best_gen_obj"]   # measure by best objective found during sampling
+                checkpoint["validation_metric"] = val_metric
+                save_checkpoint(checkpoint, "last_model.pt", gen_config)
 
-            # log metrics per epoch 
-            '''for key, val in generated_loggable_dict.items():
-                mlflow.log_metric(key, val, step=epoch)'''
+                # log metrics per epoch 
+                for key, val in generated_loggable_dict.items():
+                    mlflow.log_metric(key, val, step=epoch)
 
-            if val_metric > best_validation_metric:
-                print(">> Got new best model.")
-                checkpoint["best_model_weights"] = copy.deepcopy(checkpoint["model_weights"])
-                checkpoint["best_validation_metric"] = val_metric
-                best_model_weights = checkpoint["best_model_weights"]
-                best_validation_metric = val_metric
-                save_checkpoint(checkpoint, "best_model.pt", gen_config)
+                if val_metric > best_validation_metric:
+                    print(">> Got new best model.")
+                    checkpoint["best_model_weights"] = copy.deepcopy(checkpoint["model_weights"])
+                    checkpoint["best_validation_metric"] = val_metric
+                    best_model_weights = checkpoint["best_model_weights"]
+                    best_validation_metric = val_metric
+                    save_checkpoint(checkpoint, "best_model.pt", gen_config)
 
-            if start_time_counter is not None and time.perf_counter() - start_time_counter > gen_config.wall_clock_limit:
-                print("Time exceeded. Stopping training.")
-                break
+                if start_time_counter is not None and time.perf_counter() - start_time_counter > gen_config.wall_clock_limit:
+                    print("Time exceeded. Stopping training.")
+                    break
 
     if gen_config.num_epochs == 0:
         print(f"Testing with loaded model.")
@@ -297,3 +319,7 @@ if __name__ == '__main__':
             
     print("Finished. Shutting down ray.")
     ray.shutdown()
+
+if __name__=='__main__':
+    args = parse_args()
+    main(args)

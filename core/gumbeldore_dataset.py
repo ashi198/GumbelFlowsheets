@@ -204,10 +204,8 @@ def async_sbs_worker(gen_config, env_config, job_pool: JobPool, network_weights:
     
     '''def batch_leaf_evaluation_fn(trajectories: List[FlowsheetDesign]) -> np.array:
         objs = [traj.objective for traj in trajectories]
-        #per_ratio = [traj.sim.performance_ratio for traj in trajectories]
-        literature_ratio = [traj.literature_bonus for traj in trajectories]
-        return objs + literature_ratio'''
-    
+        return objs'''
+
     def batch_leaf_evaluation_fn(trajectories: List[FlowsheetDesign]) -> np.array:
         for traj in trajectories:
             npv = traj.objective 
@@ -215,7 +213,7 @@ def async_sbs_worker(gen_config, env_config, job_pool: JobPool, network_weights:
             traj.objective = npv + literature_ratio
         
         objs = [traj.objective for traj in trajectories]
-        return objs 
+        return objs
 
     def child_transition_fn(trajectory_action_pairs: List[Tuple[FlowsheetDesign, int]]):
         return [traj.transition_fn(action) for traj, action in trajectory_action_pairs]
