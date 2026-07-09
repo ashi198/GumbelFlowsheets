@@ -31,7 +31,7 @@ class GeneralConfig:
         self.num_dataloader_workers = 3  # Number of workers for creating batches for training
         self.CUDA_VISIBLE_DEVICES = "0,1,2,3"  # Must be set, as ray can have problems detecting multiple GPUs
         self.training_device = args.device  # Device on which to perform the supervised training
-        self.num_epochs = 200 # Number of epochs (i.e., passes through training set) to train
+        self.num_epochs = args.epoches # Number of epochs (i.e., passes through training set) to train
         self.batch_size_training = 64 #Batch size to use for the supervised training during finetuning. 
         self.num_batches_per_epoch = 10  # Can be None, then we just do one pass through generated dataset
 
@@ -56,28 +56,20 @@ class GeneralConfig:
         self.gumbeldore_config = {
 
             # Number of trajectories with the the highest objective function evaluation to keep for training
-            "num_trajectories_to_keep": 25, # num_trajectories_to_keep for training PER system 
+            "num_trajectories_to_keep": 25, # num_trajectories_to_keep for training PER instance 
             "keep_intermediate_trajectories": True,  # if True, we consider all intermediate, terminable trajectories
             "devices_for_workers": f"{args.device}", #* 1,
             "destination_path": "./data",
             "batch_size_per_worker": 1, 
-            "batch_size_per_cpu_worker": 1,
-            "search_type": "wor",
-            "beam_width": 512,
+            "batch_size_per_cpu_worker": 2,
+            "search_type": "tasar",
+            "beam_width": 128,
             "replan_steps": 12,
             "num_rounds": 1,  # if it's a tuple, then we sample as long as it takes to obtain a better trajectory, but for a minimum of first entry rounds and a maximum of second entry rounds
             "deterministic": False,  # Only use for gumbeldore_eval=True below, switches to regular beam search.
             "nucleus_top_p": 1.,
             "pin_workers_to_core": False
         }
-
-        # Results and logging
-        '''self.results_path = os.path.join("./results",
-                                         datetime.datetime.now().strftime(
-                                             "%Y-%m-%d--%H-%M-%S"))  # Path to store the model weights
-        self.test_path = os.path.join("./test",
-                                         datetime.datetime.now().strftime(
-                                             "%Y-%m-%d--%H-%M-%S"))'''
         
         self.results_path = os.path.join(f"{args.results}", f"{args.subsystem}")
         os.makedirs(self.results_path, exist_ok=True)
@@ -110,12 +102,6 @@ class EnvConfig:
             self.systems_allowed[sub] = False
             if sub == args.subsystem or args.subsystem == 'all':
                 self.systems_allowed [sub] = True
-
-        '''self.systems_allowed = {
-        "acetone_chloroform": True,
-        "ethanol_water": False,
-        "n-butanol_water": False,
-        "water_pyridine": False}'''
         
         self.dicretization_parameter_lle = 5       # LLE simplex discretization
         self.curvature_parameter_vle = 0.001       # VLE curvature fitting
@@ -145,7 +131,7 @@ class EnvConfig:
 
         # ----- NPV & PRICING/COSTS -----
         # Choose NPV variant: "generic" (per-mole pricing) or "literature" (per-kg pricing)
-        self.npv_version = "literature"  # or "literature"
+        self.npv_version = "generic"  # or "literature"
         self.norm_npv = True  # also compute a normalized NPV
         self.credit_solvent_product = False  # if False, pure solvent leaving gets no product/performance credit
         self.enable_cost_debug = False  # keep False for training; set True only in manual/debug scripts
@@ -226,7 +212,7 @@ class EnvConfig:
 
         # Action limits depending on the subsystem
         self.action_limits = {'acetone_chloroform': {'max_total_units': 5, 'min_total_units': 4, 'max_distillation_columns': 3, 'max_decanters': 1, 'max_split': 0, 'max_mixer': 0, 'max_recycle': 2, 'max_solvent': 1}, 
-                            'ethanol_water': {'max_total_units': 4, 'min_total_units': 2, 'max_distillation_columns': 2, 'max_decanters': 1, 'max_split': 0, 'max_mixer': 0, 'max_recycle': 1, 'max_solvent': 1},
+                            'ethanol_water': {'max_total_units': 4, 'min_total_units': 4, 'max_distillation_columns': 2, 'max_decanters': 1, 'max_split': 0, 'max_mixer': 0, 'max_recycle': 1, 'max_solvent': 1},
                             'n-butanol_water': {'max_total_units': 3, 'min_total_units': 3, 'max_distillation_columns': 2, 'max_decanters': 1, 'max_split': 0, 'max_mixer': 0, 'max_recycle': 2, 'max_solvent': 0}, 
                             'water_pyridine': {'max_total_units': 4, 'min_total_units': 4, 'max_distillation_columns': 2, 'max_decanters': 1, 'max_split': 0, 'max_mixer': 0, 'max_recycle': 2, 'max_solvent': 1},
                             'all': {'max_total_units': 5, 'min_total_units': 2, 'max_distillation_columns': 3, 'max_decanters': 1, 'max_split': 0, 'max_mixer': 0, 'max_recycle': 2, 'max_solvent': 1}}
@@ -254,7 +240,7 @@ class EnvConfig:
         # List of mappings for params for distillation, split, add_solvent
         self.DF_distillation_map = np.linspace(0.01, 0.99, 100)
         self.split_ratio_map = np.linspace(0.01, 0.99, 100)
-        _amount_grid = np.linspace(0.01, 1.99, 100)
+        _amount_grid = np.linspace(0.01, 4.99, 100)
         self.add_solvent_comp_map = {
             name: _amount_grid.copy()
             for name in self.component_names
@@ -272,8 +258,8 @@ class EnvConfig:
         "ethanol_water": [
             {"name": "ethanol_water_dc_dc_decanter", "desired_nodes": {0: "feed", 1: "add_solvent", 2: "distillation_column", 3: "distillation_column",
                 4: "decanter",}, "desired_edges": {(0, 1, False), (1, 2, False), (2, 3, False), (3, 4, False),(4, 1, True),},},
-            {"name": "ethanol_water_dc_dc_recycle", "desired_nodes": {0: "feed", 1: "distillation_column", 2: "distillation_column",},
-            "desired_edges": {(0, 1, False), (1, 2, False), (2, 1, True),},},], 
+            {"name": "ethanol_water_dc_dc_recycle", "desired_nodes": {0: "feed", 1: "add_solvent", 2: "distillation_column", 3: "distillation_column",},
+            "desired_edges": {(0, 1, False), (1, 2, False), (2, 3, False),(3, 1, True)},},], 
         "n-butanol_water": [
                         {"name": "n-butanol_water", "desired_nodes": {0: "feed", 1: "decanter", 2: "distillation_column", 3: "distillation_column",}, 
                          "desired_edges": {(0, 1, False), (1, 2, False), (1, 3, False), (2, 1, True),(3, 1, True),},},

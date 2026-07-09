@@ -150,7 +150,7 @@ class FlowsheetDesign:
             if total_limit_reached:
                 # only recycler add mode
                 for i, stream in enumerate(open_streams):
-                    if self._stream_has_valid_recycle(stream):
+                    if self._stream_has_valid_recycle(stream) or self._pure_stream_valid_recycle(stream):
                         mask[i + 1] = 1
             else:
                 mask[1:] = 1
@@ -193,17 +193,11 @@ class FlowsheetDesign:
                             continue 
                         else:
                             unit_params_mask[idx] = 1
+                            
                 if unit_name == "recycle" and avail_unit:
-                    # need a chosen stream (comes from level 0) and at least one eligible des
 
-                    '''eligible_recycle_destinations = self._eligible_recycle_destinations()
-                    self.eligible_recycle_destinations = eligible_recycle_destinations
-                    if self.current_state["chosen_open_stream"] is None or len(eligible_recycle_destinations) == 0:
-                        continue
-                    else:
-                        unit_params_mask[idx] = 1'''
-                    
-                    if self._stream_has_valid_recycle(self.current_state["chosen_open_stream"]) or self._is_pure_solvent_stream(self.current_state["chosen_open_stream"]):
+                    # need a chosen stream (comes from level 0) and at least one eligible dests
+                    if self._stream_has_valid_recycle(self.current_state["chosen_open_stream"]) or self._pure_stream_valid_recycle(self.current_state["chosen_open_stream"]):
                         unit_params_mask[idx] = 1
 
             self.current_action_mask = unit_params_mask
@@ -214,25 +208,30 @@ class FlowsheetDesign:
             _, chosen_unit_name = self.current_state["chosen_unit"]
 
             if chosen_unit_name in ["distillation_column", "split"]:
-                params_mask = np.ones(100, dtype=int)
+                params_mask = np.ones(len(self.env_config.DF_distillation_map), dtype=int)
+                
             elif chosen_unit_name == "add_solvent":
                 params_mask = np.zeros(len(self.env_config.component_names), dtype= int)
                 for i in self.problem_instance['possible_ind_add_comp']:
                     params_mask[i] = 1
+
             elif chosen_unit_name == "recycle":
                 node_ids = list(self.sim.graph.nodes)
                 source_node, _ = self.current_state["chosen_open_stream"]
                 id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
                 params_mask = np.zeros(len(node_ids), dtype=int) 
+                recycle_dests = self._eligible_recycle_destinations(stream=self.current_state["chosen_open_stream"])
 
-                if self._stream_has_valid_recycle(self.current_state["chosen_open_stream"]):
-                    recycle_dests = self._eligible_recycle_destinations()
+                if self._pure_stream_valid_recycle(self.current_state["chosen_open_stream"]):
+                    for i in recycle_dests:
+                        if self.sim.graph.nodes[i]["unit_type"] == "add_solvent":
+                            idx = id_to_idx[i]
+                            params_mask[idx] = 1
+                elif self._stream_has_valid_recycle(self.current_state["chosen_open_stream"]):
                     for i in recycle_dests:
                         if i != source_node:
                             idx = id_to_idx[i]
                             params_mask[idx] = 1
-                    if not np.any(params_mask):
-                        print('goofup here')
 
             elif chosen_unit_name == "mixer":
                 src_node, _ = self.current_state["chosen_open_stream"]
@@ -251,7 +250,9 @@ class FlowsheetDesign:
         elif self.level == 3:
             _, unit_name = self.current_state["chosen_unit"]
             if unit_name == "add_solvent":
-                params_mask =  np.ones(100, dtype=int)
+                _, component, _, _ = self.current_state["pending_params"]["add_solvent"].values()
+                if component:
+                    params_mask =  np.ones(len(self.env_config.add_solvent_comp_map[component]), dtype=int)
 
             if unit_name == "mixer":
                 src_node, _ = self.current_state["chosen_open_stream"]
@@ -297,8 +298,8 @@ class FlowsheetDesign:
 
         """
 
-        assert not self.current_state['completed_design'], "Taking action on an already terminated design!"
-        
+        #assert not self.current_state['completed_design'], "Taking action on an already terminated design!"
+
         assert self.current_action_mask[action_index] == 1, \
             f"Trying to take action {action_index} on level {self.level}, but it is set to infeasible"
         
@@ -306,6 +307,12 @@ class FlowsheetDesign:
             raise ValueError(f"Invalid action {action_index}, mask size {len(self.current_action_mask)}")
 
         try:
+            '''if action_index >= len(self.current_action_mask):
+                raise ValueError(f"Invalid action {action_index}, mask size {len(self.current_action_mask)}")
+        
+            if self.current_action_mask[action_index] == 0:
+                raise ValueError(f"Trying to take action {action_index} on level {self.level}, but it is set to infeasible")'''
+        
             action_index = int(action_index)
             self.current_state['current_level'] = self.level 
             self.current_state['current_action_mask'] = self.current_action_mask
@@ -450,9 +457,10 @@ class FlowsheetDesign:
                         
                 # choose destination stream for recycle
                 elif self._chosen_unit_name() == "recycle":
-                    dests = self._eligible_recycle_destinations()
-                    node_ids = list(self.sim.graph.nodes)
+                    stream = self.current_state["chosen_open_stream"]
+                    dests = self._eligible_recycle_destinations(stream)
 
+                    node_ids = list(self.sim.graph.nodes)
                     id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
                     idx_to_id = {v: k for k, v in id_to_idx.items()}
                     if len(dests) == 0:
@@ -663,7 +671,8 @@ class FlowsheetDesign:
 
         return True
     
-    def _stream_is_recyclable(self, stream, purity_cutoff=0.90, eps=1e-12):
+    '''def _stream_is_recyclable(self, stream, purity_cutoff=0.95, eps=1e-12):
+        
         node_id, lab = stream
         flow = np.asarray(self.sim.graph.nodes[node_id]["output_flows"][lab], dtype=float)
         total = flow.sum()
@@ -672,31 +681,71 @@ class FlowsheetDesign:
             return False
 
         y = flow / total
+
+        num_comps_in_feed = len(self.problem_instance["indices_components_in_feeds"])
+        feed_y = y[:num_comps_in_feed]
+        solvent_y = y[num_comps_in_feed:]
+
+        feed_purity = np.max(feed_y) if len(feed_y) > 0 else 0.0
+        solvent_frac = solvent_y.sum() if len(solvent_y) > 0 else 0.0
 
         # if already pure enough, do not recycle it
-        num_comps_in_feed = len(self.problem_instance["indices_components_in_feeds"])
-        if np.max(y[:num_comps_in_feed]) >= purity_cutoff:
-            return False
+        not_pure_feed = feed_purity <= purity_cutoff
         
-        return True and not self._node_already_has_recycle(stream)
+        # if most solvent in the stream, still
+        already_pure_solvent = solvent_frac >= purity_cutoff
+        
+        return (not_pure_feed or already_pure_solvent) and not self._node_already_has_recycle(stream)'''
+    
+    def _stream_is_recyclable(self, stream, purity_cutoff=0.95, eps=1e-12):
+        
+        node_id, lab = stream
+        flow = np.asarray(self.sim.graph.nodes[node_id]["output_flows"][lab], dtype=float)
+        total = flow.sum()
+        if total <= 1e-12:
+            return False  
+        
+        y = flow / total
+
+        num_comps_in_feed = len(self.problem_instance["indices_components_in_feeds"])
+        feed_y = y[:num_comps_in_feed]
+
+        feed_purity = np.max(feed_y) if len(feed_y) > 0 else 0.0
+
+        # if already pure enough, do not recycle it
+        not_pure_stream = feed_purity <= purity_cutoff
+
+        
+        return not_pure_stream and not self._node_already_has_recycle(stream)
     
     def _is_pure_solvent_stream(self, stream, eps=1e-12):
+
         node_id, lab = stream
         flow = np.asarray(self.sim.graph.nodes[node_id]["output_flows"][lab], dtype=float)
         total = flow.sum()
         if total <= eps:
             return False
 
-        y = flow / total
-        solvent_idx = 2
-        return y[solvent_idx] >= 0.99
+        num_feed = len(self.problem_instance["indices_components_in_feeds"])
+        solvent_flow = flow[num_feed:]
+        solvent_total = float(solvent_flow.sum())
+        solvent_frac = solvent_total / total
+
+        if_not_source_add_solvent = self.sim.graph.nodes[node_id]["unit_type"] != "add_solvent"
+        return solvent_frac >= 0.90 and if_not_source_add_solvent 
     
     def _stream_has_valid_recycle(self, stream) -> bool:
         dests = self._eligible_recycle_destinations(stream=stream)
         dests_valid = len(dests) > 0
-        if_recyclable = self._stream_is_recyclable(stream)
-
+        if_recyclable = self._stream_is_recyclable(stream) # if this particular stream has not been recycled before and is not a pure stream
         return if_recyclable and dests_valid
+    
+    def _pure_stream_valid_recycle(self, stream) -> bool:
+        is_pure_stream = self._is_pure_solvent_stream(stream)
+        dests = self._eligible_recycle_destinations(stream=stream)
+        _add_solvent_as_dest_present = any(self.sim.graph.nodes[dest]["unit_type"] == "add_solvent" for dest in dests)
+
+        return is_pure_stream and _add_solvent_as_dest_present
     
     def _node_already_has_recycle(self, node_id):
         for u, v, data in self.sim.graph.edges(data=True):
