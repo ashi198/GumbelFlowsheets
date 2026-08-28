@@ -12,32 +12,34 @@ class GeneralConfig:
     """
         
 
-    def __init__(self):
-        self.seed = 23
+    def __init__(self, args):
+        self.seed = args.seed
 
         # Network and environment
         self.latent_dim = 256 #latent dimension for Core transformer 
-        self.num_transformer_blocks = 10 # Number of layers in the stack of transformer blocks for the architecture
+        self.num_transformer_blocks = 5 # Number of layers in the stack of transformer blocks for the architecture
         self.num_heads = 16 # Number of heads in the multihead attention.
         self.dropout = 0. # Dropout for feedforward layer in a transformer block.
         self.num_trf_flow_blocks = 3 #num of transformer blocks for flow expert 
         self.flow_latent_dim = 64
 
         # Loading trained checkpoints to resume training or evaluate
-        self.load_checkpoint_from_path = '/media/raid5/hswt304ash/GumbelFlowsheets/results/results_256_BS_128_100_epoch/best_model.pt'  # If given, model checkpoint is loaded from this path.
+        self.load_checkpoint_from_path = None  # If given, model checkpoint is loaded from this path.
         self.load_optimizer_state = False  # If True, the optimizer state is also loaded.
 
         # Training
         self.num_dataloader_workers = 3  # Number of workers for creating batches for training
         self.CUDA_VISIBLE_DEVICES = "0,1,2,3"  # Must be set, as ray can have problems detecting multiple GPUs
-        self.training_device = "cuda:3"  # Device on which to perform the supervised training
-        self.num_epochs = 50 # Number of epochs (i.e., passes through training set) to train
-        self.batch_size_training = 64 #Batch size to use for the supervised training during finetuning. 
+        self.training_device = args.device  # Device on which to perform the supervised training
+        self.num_epochs = args.epoches # Number of epochs (i.e., passes through training set) to train
+        self.batch_size_training = 128 #Batch size to use for the supervised training during finetuning. 
         self.num_batches_per_epoch = None  # Can be None, then we just do one pass through generated dataset
 
         self.wall_clock_limit = None
-        self.mlflow_experiment = 'test'
-        
+        self.mlflow_experiment = 'new_cost_function_improved_learning'
+        self.steps = 50 #how many instances per systems should be generated within the test set
+        self.balanced = False if args.subsystem != 'all' else True
+        self.num_instances_per_batch = 3
 
         # Optimizer
         self.optimizer = {
@@ -54,26 +56,29 @@ class GeneralConfig:
         self.gumbeldore_config = {
 
             # Number of trajectories with the the highest objective function evaluation to keep for training
-            "num_trajectories_to_keep": 100,
+            "num_trajectories_to_keep": 20, # num_trajectories_to_keep for training PER instance 
             "keep_intermediate_trajectories": True,  # if True, we consider all intermediate, terminable trajectories
-            "devices_for_workers": ["cuda:3"] * 1,
+            "devices_for_workers": f"{args.device}" * 1,
             "destination_path": "./data",
             "batch_size_per_worker": 1, 
-            "batch_size_per_cpu_worker": 1,
-            "search_type": "beam_search",
-            "beam_width": 64,
+            "batch_size_per_cpu_worker": 4,
+            "search_type": args.beam_search_type,
+            "beam_width": args.beam_search,
             "replan_steps": 12,
             "num_rounds": 1,  # if it's a tuple, then we sample as long as it takes to obtain a better trajectory, but for a minimum of first entry rounds and a maximum of second entry rounds
             "deterministic": False,  # Only use for gumbeldore_eval=True below, switches to regular beam search.
             "nucleus_top_p": 1.,
-            "pin_workers_to_core": False
-        }
+            "pin_workers_to_core": False, 
+            "expert_min_obj": 0.20, 
+            "replay_min_obj": 0.7, 
+            "replay_top_k_per_instance": 5,
+            "replay_every": 5
 
-        # Results and logging
-        '''self.results_path = os.path.join("./results",
-                                         datetime.datetime.now().strftime(
-                                             "%Y-%m-%d--%H-%M-%S"))'''  # Path to store the model weights
-        self.results_path = '/media/raid5/hswt304ash/GumbelFlowsheets/results/results_256_BS_128_100_epoch'
+        }
+        
+        self.results_path = os.path.join(f"{args.results}", f"{args.subsystem}")
+        os.makedirs(self.results_path, exist_ok=True)
+
         self.log_to_file = True
 
 
@@ -87,7 +92,7 @@ class EnvConfig:
     - Generates random feed problem instances
     """
 
-    def __init__(self):
+    def __init__(self, args):
 
         # ----- Core dimensional settings -----
 
@@ -96,12 +101,14 @@ class EnvConfig:
         self.max_simulator_tries = 30
 
         # ----- Phase equilibrium / property data -----
-        self.systems_allowed = {
-            "acetone_chloroform": True,
-            "ethanol_water": True,
-            "n-butanol_water": True,
-            "water_pyridine": True
-        }
+        all_subsystems = ['acetone_chloroform', 'ethanol_water', 'water_pyridine', 'n-butanol_water']
+        self.systems_allowed = {}
+        for sub in all_subsystems: 
+            self.systems_allowed[sub] = False
+            if sub == args.subsystem or args.subsystem == 'all':
+                self.systems_allowed [sub] = True
+                self.systems_allowed ['n-butanol_water'] = False
+        
         self.dicretization_parameter_lle = 5       # LLE simplex discretization
         self.curvature_parameter_vle = 0.001       # VLE curvature fitting
 
@@ -125,21 +132,27 @@ class EnvConfig:
             dtype=torch.float32
         )
 
+        self.gamma_mean = None # mean value of the entire training-set gamma values
+        self.gamma_std = None #std of the entire training-set gamma values
+
         # Shuffle option for feed component order (usually keep False for stable tests)
         self.shuffle_order_of_components = False
 
         # ----- NPV & PRICING/COSTS -----
         # Choose NPV variant: "generic" (per-mole pricing) or "literature" (per-kg pricing)
-        self.npv_version = "literature"  # or "literature"
+        self.npv_version = "generic"  # or "literature"
         self.norm_npv = True  # also compute a normalized NPV
+        self.credit_solvent_product = False  # if False, pure solvent leaving gets no product/performance credit
+        self.enable_cost_debug = False  # keep False for training; set True only in manual/debug scripts
+        self.allow_forward_recycles = False  # if False, recycle destinations must be upstream/lower node id
 
         # Build dynamic price/cost maps that always match the global component list
         names = self.phase_eq_generator.names_components
         self.num_components = len(names)
 
         # Uniform defaults (edit these two numbers to tune all components at once)
-        _uniform_product_price_per_mol = 100.0  # value for pure product streams (per mole) in "generic" mode
-        _uniform_solvent_cost_per_mol = 10.0  # cost when a component is used as solvent (per mole) in "generic" mode
+        _uniform_product_price_per_mol = 1000.0  # value for pure product streams (per mole) in "generic" mode
+        _uniform_solvent_cost_per_mol = 100.0  # cost when a component is used as solvent (per mole) in "generic" mode
 
         _uniform_product_value_per_kg = 0.5  # value per kg in "literature" mode (set >0 to activate economics there)
         _uniform_solvent_cost_per_kg = 0.05  # cost per kg of solvent in "literature" mode
@@ -156,18 +169,18 @@ class EnvConfig:
 
         # Per-unit costs (used by compute_npv in the simulator)
         self.unit_costs_generic = {
-            "add_solvent": 2.0,
+            "add_solvent": 0.2,
             "distillation_column": 10.0,
             "decanter": 2.0,
-            "split": 1.0,
-            "mixer": 1.0
+            "split": 0.2,
+            "mixer": 0.2
         }
         self.unit_costs_literature = {
             "add_solvent": 200000,
             "distillation_column": 1000000,
             "decanter": 200000,
-            "split": 100000,
-            "mixer": 100000,
+            "split": 40000,
+            "mixer": 40000,
             "steam_cost_per_kg": 0.04 # Energy/steam cost for distillation operating expenses
         }
 
@@ -178,12 +191,12 @@ class EnvConfig:
         # Unit definitions: how many outputs, whether they need a continuous spec (range),
         # and which level to go to next.
         self.unit_types = {
-            "distillation_column": {"num": 1, "output_streams": 2, "cont_range": [0.01, 0.99]},
+            "distillation_column": {"num": 1, "output_streams": 2, "cont_range": [0.1, 0.95]},
             "decanter":            {"num": 1, "output_streams": 2, "cont_range": None},
-            "split":               {"num": 1, "output_streams": 2, "cont_range": [0.01, 0.99]},
+            "split":               {"num": 1, "output_streams": 2, "cont_range": [0.1, 0.95]},
             "mixer":               {"num": 1, "output_streams": 1, "cont_range": None},
             "recycle":             {"num": 1, "output_streams": 1, "cont_range": None},
-            "add_solvent":         {"num": 1,"output_streams": 1, "cont_range": [0.01, 10]},
+            "add_solvent":         {"num": 1,"output_streams": 1, "cont_range": [0.1, 1.95]},
         }
 
         self.outlet_to_idx = {"out0": 0, "out1": 1}
@@ -205,15 +218,13 @@ class EnvConfig:
             if key == "add_solvent":
                 self.add_solvent_start_index = i
                 break
-            
-        # Action limits
-        self.max_total_units = 4 # overall cap on placed units (excluding feed)
-        self.max_distillation_columns = 3
-        self.max_decanters = 2
-        self.max_split = 1
-        self.max_mixer = 1
-        self.max_recycle = 2
-        self.max_solvent = 1
+
+        # Action limits depending on the subsystem
+        self.action_limits = {'acetone_chloroform': {'max_total_units': 5, 'min_total_units': 4, 'max_distillation_columns': 3, 'max_decanters': 1, 'max_split': 0, 'max_mixer': 0, 'max_recycle': 2, 'max_solvent': 1}, 
+                    'ethanol_water': {'max_total_units': 5, 'min_total_units': 4, 'max_distillation_columns': 3, 'max_decanters': 1, 'max_split': 0, 'max_mixer': 0, 'max_recycle': 2, 'max_solvent': 1},
+                    'n-butanol_water': {'max_total_units': 3, 'min_total_units': 2, 'max_distillation_columns': 2, 'max_decanters': 1, 'max_split': 0, 'max_mixer': 0, 'max_recycle': 2, 'max_solvent': 0}, 
+                    'water_pyridine': {'max_total_units': 4, 'min_total_units': 3, 'max_distillation_columns': 2, 'max_decanters': 1, 'max_split': 0, 'max_mixer': 0, 'max_recycle': 2, 'max_solvent': 1},
+                    'all': {'max_total_units': 6, 'min_total_units': 2, 'max_distillation_columns': 3, 'max_decanters': 1, 'max_split': 1, 'max_mixer': 1, 'max_recycle': 2, 'max_solvent': 1}}
 
         # ----- Recycle solver config -----
         # recycle guesses; see original env for semantics
@@ -234,63 +245,129 @@ class EnvConfig:
         self.mb_severe_atol = 1e-3
         self.mb_rtol = 1e-8 #relative tolerabce
 
-        
         # List of mappings for params for distillation, split, add_solvent
-        self.DF_distillation_map = np.linspace(0.01, 0.99, 100)
-        self.split_ratio_map = np.linspace(0.01, 0.99, 100)
-        self.add_solvent_comp_map = np.linspace(0.01, 9.99, 100)
+        self.DF_distillation_map = np.linspace(0.02, 0.99, 50)
+        self.split_ratio_map = np.linspace(0.02, 0.95, 50)
+        #self._amount_grid = np.linspace(0.1, 4.99, 50)
+        self._amount_grid = np.linspace(0.1, 4.99, 50)
+        self.add_solvent_comp_map = {
+            name: self._amount_grid.copy()
+            for name in self.component_names
+        }
 
+        # literature based flowsheet motifs 
+        '''self.literature_motifs = {
+        "acetone_chloroform": [
+            {"name": "ace_chl", 
+            "desired_nodes": {0: "feed", 1: "add_solvent", 2: "distillation_column", 3: "distillation_column",
+            4: "distillation_column", 5: "decanter",}, 
+        "desired_edges": {(0, 1, False),(1, 2, False),(2, 3, False),(3, 4, False),(4, 5, False),
+            (5, 1, True),(5, 3, True),},
+            }],
+        "ethanol_water": [
+            {"name": "ethanol_water_dc_dc_decanter", "desired_nodes": {0: "feed", 1: "add_solvent", 2: "distillation_column", 3: "distillation_column",
+                4: "decanter",}, "desired_edges": {(0, 1, False), (1, 2, False), (2, 3, False), (3, 4, False),(4, 1, True),},},
+            {"name": "ethanol_water_dc_dc_recycle", "desired_nodes": {0: "feed", 1: "add_solvent", 2: "distillation_column", 3: "distillation_column",},
+            "desired_edges": {(0, 1, False), (1, 2, False), (2, 3, False),(3, 1, True)},},], 
+        "n-butanol_water": [
+                        {"name": "n-butanol_water", "desired_nodes": {0: "feed", 1: "decanter", 2: "distillation_column", 3: "distillation_column",}, 
+                         "desired_edges": {(0, 1, False), (1, 2, False), (1, 3, False), (2, 1, True),(3, 1, True),},},
 
-    # Random feed generator
-    def create_random_problem_instance(self, sampled_index):
+            {"name": "ethanol_water_dc_dc_recycle", "desired_nodes": {0: "feed", 1: "distillation_column", 2: "distillation_column",},
+            "desired_edges": {(0, 1, False), (1, 2, False), (2, 1, True),},},],
+        "water_pyridine": [{
+            "name": "water_pyridine", 
+            "desired_nodes": {0: "feed", 1: "add_solvent", 2: "distillation_column", 3: "decanter", 
+                              4: "distillation_column",}, 
+                "desired_edges": {(0, 1, False), (1, 2, False), (2, 3, False), (2, 4, False),(3, 1, True),
+                                  (4, 2, True),},
+        }],
+    }'''
+        
+        self.literature_motifs = {
+            "acetone_chloroform": [
+            {"name": "ace_chl_4", 
+                "desired_nodes": {0: "feed", 1: "add_solvent", 2: "distillation_column", 3: "distillation_column",
+                4: "distillation_column",}, 
+            "desired_edges": {(0, 1, False),(1, 2, False),(2, 3, False),(3, 4, False),
+                (3, 1, True),(4, 2, True),},
+                },
+                ],
 
+            "ethanol_water": [{
+                            "name": "ethanol_water_5",
+                    "desired_nodes": {
+                        0: "feed",
+                        1: "distillation_column",
+                        2: "add_solvent",
+                        3: "distillation_column",
+                        4: "distillation_column",
+                        5: "decanter",
+                    },
+                    "desired_edges": {
+                        (0, 1, False),
+                        (1, 2, False),
+                        (2, 3, False),
+                        (3, 4, False),
+                        (4, 5, False),
+                    },
+                },
+
+                {"name": "ethanol_water_4", "desired_nodes": {0: "feed", 1: "distillation_column", 2: "add_solvent", 3: "distillation_column", 
+                                                                               4: "decanter"}, "desired_edges": {(0, 1, False), (1, 2, False), (2, 3, False), (3, 4, False), 
+                                                                                              (4, 2, True), (4, 1, True)},},
+                {"name": "ethanol_water_4_wo_recy", "desired_nodes": {0: "feed", 1: "distillation_column", 2: "add_solvent", 3: "distillation_column", 
+                4: "decanter"}, "desired_edges": {(0, 1, False), (1, 2, False), (2, 3, False), (3, 4, False),},},], 
+            "n-butanol_water": [
+                            {"name": "n-butanol_water", "desired_nodes": {0: "feed", 1: "decanter", 2: "distillation_column", 3: "distillation_column",}, 
+                            "desired_edges": {(0, 1, False), (1, 2, False), (1, 3, False), (2, 1, True),(3, 1, True),},},], 
+            "water_pyridine": [{
+                "name": "water_pyridine", 
+                "desired_nodes": {0: "feed", 1: "add_solvent", 2: "distillation_column", 3: "decanter", 
+                                4: "distillation_column",}, 
+                    "desired_edges": {(0, 1, False), (1, 2, False), (2, 3, False), (2, 4, False),
+                                    (3, 1, True), (4, 1, True)},
+            }],
+        }
+
+    def create_random_problem_instance(self, index):
         """
-        Sample a feed situation of format:
-          [[global indices for feed], [global indices allowed as solvent], number_of_feed_streams]
-        Return:
-          {
-            "feed_situation_index": int,
-            "indices_components_in_feeds": list[int],
-            "list_feed_streams": [np.array(len=max_number_of_components)],
-            "possible_ind_add_comp": list[int],
-            "comp_order_feeds": [names],
-            "lle_for_start": None,
-            "vle_for_start": None
-          }
-          
+        sample a feed situation of format: [[indices from self.names_components for feed],
+        [indices from self.names_components for add_component unit], number of feed streams]
+        and return the situation index, feed streams, restrictions for add component unit and
+        the names and order of the components in the streams
         """
         feed_streams = []
 
-        # sample a feed situation from the PEQ generator
+        # sample a feed situation
         #sampled_index = np.random.randint(len(self.phase_eq_generator.feed_situations))
+        sampled_index = index
         sampled_situation = copy.deepcopy(self.phase_eq_generator.feed_situations[sampled_index])
-        # sampled_situation: [[feed_global_indices], [allowed_add_comp_global_indices], num_streams]
 
-        # optionally shuffle order of components in the feed streams
+        # shuffle order if specified
         if self.shuffle_order_of_components:
             np.random.shuffle(sampled_situation[0])
 
-        # get names for readability
-        names_in_streams = [
-            self.phase_eq_generator.names_components[i] for i in sampled_situation[0]
-        ]
+        # get names in feed streams
+        names_in_streams = []
+        for i in sampled_situation[0]:
+            names_in_streams.append(self.phase_eq_generator.names_components[i])
 
-        # generate the feed stream(s)
-        for _ in range(sampled_situation[-1]):
-            base = np.random.rand(len(sampled_situation[0]))
-            base = base / (sampled_situation[-1] * np.sum(base))  # normalize and split across streams
+        for i in range(sampled_situation[-1]):
+            sampled_flowrates = np.random.rand(len(sampled_situation[0]))
+            # normalize to 1 total flowrate
+            sampled_flowrates = sampled_flowrates / (
+                    sampled_situation[-1] * sum(sampled_flowrates))
 
             stream = np.zeros(self.max_number_of_components)
-            stream[:len(base)] = base
+            stream[:len(sampled_flowrates)] = sampled_flowrates
             feed_streams.append(stream)
 
-        return {
-            "feed_situation_index": sampled_index,
-            "indices_components_in_feeds": sampled_situation[0],
-            "list_feed_streams": feed_streams,
-            "possible_ind_add_comp": sampled_situation[1],
-            "comp_order_feeds": names_in_streams,
-            # placeholders; graph simulator determines current PEQ from indices on-the-fly
-            "lle_for_start": None,
-            "vle_for_start": None
-        }
+        return {"feed_situation_index": sampled_index,
+                "indices_components_in_feeds": sampled_situation[0],
+                "list_feed_streams": feed_streams,
+                "possible_ind_add_comp": sampled_situation[1],
+                "comp_order_feeds": names_in_streams,
+                "system_name": "_".join(names_in_streams), 
+                "lle_for_start": None,
+                "vle_for_start": None}

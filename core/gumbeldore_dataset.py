@@ -8,6 +8,8 @@ from core.abstract import Instance
 import core.stochastic_beam_search as sbs
 from typing import List, Tuple, Any, Optional
 from core.incremental_sbs import IncrementalSBS
+from utils import dump_top_flowsheets_txt, process_test_results
+from collections import defaultdict
 
 os.environ["RAY_DEDUP_LOGS"] = "0"
 
@@ -35,13 +37,15 @@ class JobPool:
     
 
 class GumbeldoreDataset:
-    def __init__(self, gen_config, env_config):
+    def __init__(self, gen_config, env_config, train_instances):
         self.gen_config = gen_config
         self.gumbeldore_config = gen_config.gumbeldore_config
         self.env_config = env_config
-        self.devices_for_workers: List[str] = self.gumbeldore_config["devices_for_workers"]
+        self.devices_for_workers: List[str] = self.gumbeldore_config["devices_for_workers"],
+        self.train_instances = train_instances 
 
-    def generate_dataset(self, network_weights: dict, best_objective: Optional[float] = None, memory_aggressive: bool = False, system_index: int = None, destination_path: str = None):
+    def generate_dataset(self, network_weights: dict, best_objective: Optional[float] = None, memory_aggressive: bool = False, if_test: bool= None, 
+                         epoch: int = None):
         
         """
         Parameters:
@@ -54,8 +58,11 @@ class GumbeldoreDataset:
         batch_size_gpu, batch_size_cpu = (self.gumbeldore_config["batch_size_per_worker"],
                                             self.gumbeldore_config["batch_size_per_cpu_worker"])
 
-        random_instance = self.env_config.create_random_problem_instance(system_index)
-        problem_instances = FlowsheetDesign.design_flowsheets(random_instance, self.gen_config, self.env_config)
+        problem_instances = []
+        train_instances_search = self.train_instances 
+        for instance in train_instances_search:
+            problem_instance = FlowsheetDesign.design_flowsheets(instance, self.gen_config, self.env_config)
+            problem_instances.append(problem_instance)
 
         job_pool = JobPool.remote(copy.deepcopy(problem_instances))
         results = [None] * len(problem_instances)
@@ -70,7 +77,6 @@ class GumbeldoreDataset:
         # Kick off workers
         future_tasks = [
             async_sbs_worker.remote(
-            #async_sbs_worker(
                 self.gen_config, self.env_config, job_pool, network_weights, device,
                 batch_size_gpu if device != "cpu" else batch_size_cpu,
                 cpu_cores[i], best_objective, memory_aggressive
@@ -95,10 +101,55 @@ class GumbeldoreDataset:
         del network_weights
         torch.cuda.empty_cache()
 
-        return self.process_results(problem_instances, results, destination_path)
-    
+        if not if_test: 
+            return self.process_results(problem_instances, results, self.gen_config.results_path, epoch, if_test)
+        else:
+            process_test_results(problem_instances, results, self.gen_config.results_path, epoch, if_test)
 
-    def process_results(self, problem_instances, results, destination_path):
+
+    def update_replay_buffer(self, instances, destination_path):
+
+        replay_path = f"{destination_path}/replay_buffer.pickle"
+
+        replay_min_obj = self.gumbeldore_config.get("replay_min_obj", 0.80)
+
+        replay_top_k = self.gumbeldore_config.get("replay_top_k_per_instance", 5)
+
+        # Load existing replay buffer
+        if os.path.isfile(replay_path):
+            with open(replay_path, "rb") as f:
+                replay_fs = pickle.load(f)
+        else:
+            replay_fs = []
+
+        # Only VERY GOOD candidates from this iteration
+        new_replay_candidates = [fs for fs in instances if fs["obj"] >= replay_min_obj]
+        replay_fs.extend(new_replay_candidates)
+
+        # Group by actual problem/feed instance
+        grouped = defaultdict(list)
+
+        for fs in replay_fs:
+            key = (fs["problem_instance"]["feed_situation_index"], tuple(np.round( fs["problem_instance"]["list_feed_streams"][0],6)))
+            grouped[key].append(fs)
+
+        # Keep only strongest trajectories per instance
+        cleaned_replay = []
+        for key, candidates in grouped.items():
+            candidates = sorted(candidates, key=lambda x: x["obj"], reverse=True)
+            cleaned_replay.extend(candidates[:replay_top_k])
+
+        # Save
+        with open(replay_path, "wb") as f:
+            pickle.dump(cleaned_replay, f)
+
+        print(f"[Replay buffer], " f"{len(new_replay_candidates)} new high-quality trajectories, " f"{len(cleaned_replay)} stored total.")
+
+        return replay_path
+ 
+    def process_results(self, problem_instances, results, destination_path, epoch, if_test):
+            
+
             """
             Processes the results from Gumbeldore search and save it to a pickle. Each trajectory will be represented as a dict with the
             following keys and values
@@ -110,74 +161,126 @@ class GumbeldoreDataset:
                 merged dataset.
 
             Then returns the following dictionary:
-            - "mean_best_gen_obj": Mean best generated obj. -> over the unmerged best flowsheets generated
+            - "mean_gen_obj": Mean generated obj. -> over the unmerged best flowsheets generated
             - "best_gen_obj": Best generated obj. -> Best obj. of the unmerged flowsheets generated
             - "worst_gen_obj": Worst generated obj. -> Worst obj. of the unmerged flowsheets generated
             - "mean_top_20_obj": Mean top 20 obj. -> over the merged best flowsheets
             - "top_20_flowsheets": A list of flowsheets with obj. of the top 20 obj.
             """
-            instances = []
+
             metrics_return = dict()
-            seen = set()
-            #instances_dict = dict()  # Use a dict to directly avoid duplicates
+            per_feed_index = {}
+            instances = []
+            best_generated_objs = []
+            wor_generated_objs = []
 
             for i, _ in enumerate(problem_instances):
-                for flowsheet in results[i]:  
+                per_instances = [] 
+                for flowsheet in results[i]: 
                     if flowsheet.objective > float("-inf"):
-                        hist_key = tuple(flowsheet.history)
-                        if hist_key in seen:
-                            continue
-                        seen.add(hist_key)
-                        
-                        instances.append(dict(
+                        per_instances.append(dict(
                             problem_instance = flowsheet.problem_instance,
                             identifier = flowsheet.identifier, 
                             action_seq=flowsheet.history,
                             obj=flowsheet.objective,
                             graph = flowsheet.sim.graph, 
+                            total_units_placed = flowsheet.total_units_placed,
                             levels = flowsheet.level_list,
-                            status = flowsheet.current_state['completed_design'],
-                            nvp_raw = flowsheet.sim.current_net_present_value,
-                            nvp_normed = flowsheet.sim.current_net_present_value_normed,
+                            npv_raw = flowsheet.sim.current_net_present_value,
+                            npv_normed = flowsheet.sim.current_net_present_value_normed,
                             per_ratio = flowsheet.sim.performance_ratio,
                             npv_wo_app_cost = flowsheet.sim.npv_without_app_cost,
+                            literature_bonus = flowsheet.literature_bonus,
+                            subsystem = flowsheet.problem_instance['system_name']
 
                         ))
-            #generated_fs = list(instances_dict.values())
+                per_instances.sort(key=lambda x: x["obj"], reverse=True)
+                instances.extend(per_instances)
+                key = (results[i][0].problem_instance["feed_situation_index"], tuple(np.round(results[i][0].problem_instance["list_feed_streams"][0], 6)))
+                per_feed_index[key] = per_instances
+                best_obj = max(x["obj"] for x in per_instances)
+                min_obj = min(x["obj"] for x in per_instances)
+                best_generated_objs.append(best_obj)
+                wor_generated_objs.append(min_obj)
+
+            # Log metrics
             generated_fs = instances
-            generated_fs = sorted(generated_fs, key=lambda x: x["obj"], reverse=True)[:self.gumbeldore_config["num_trajectories_to_keep"]]
+            generated_fs = sorted(generated_fs, key=lambda x: x["obj"], reverse=True)
             generated_objs = np.array([x["obj"] for x in generated_fs])
-            metrics_return["mean_best_gen_obj"] = generated_objs.mean()
-            metrics_return["best_gen_obj"] = generated_objs[0]
-            metrics_return["worst_gen_obj"] = generated_objs[-1]
+            metrics_return["mean_gen_obj"] = generated_objs.mean()
+            metrics_return["best_gen_obj"] = np.mean(best_generated_objs)
+            metrics_return["worst_gen_obj"] = np.mean(wor_generated_objs)
+
+            for result in results[0]:
+                for node_idx, node_data in result.sim.graph._node.items():
+                    if node_data['unit_type'] == 'add_solvent':
+                        print(f"solvent: {node_data['params']['component_name']}, solvent_amount: {node_data['params']['solvent_amount']}")
 
             # Now check if there already is a data file, and if so, load it and merge it.
-            #destination_path = self.gumbeldore_config["destination_path"]
-            merged_fs = generated_fs
-            feed_index = generated_fs[0]["problem_instance"]["feed_situation_index"]
             if destination_path is not None:
-                destination_full_path = (f"{destination_path}/generated_flowsheets_sys_{feed_index}.pickle")
-                if os.path.isfile(destination_full_path):
-                    with open(destination_full_path, "rb") as f:
-                        existing_fs = pickle.load(f)  # list of dicts
-                    
-                    existing_by_key = {(x["problem_instance"]["feed_situation_index"], x["identifier"]): x for x in existing_fs}
-                    for x in merged_fs: 
-                        key = (x["problem_instance"]["feed_situation_index"], x["identifier"])
-                        existing_by_key[key] = x
-                    merged_fs = list(existing_by_key.values())
-                    merged_fs = [x for x in merged_fs if x["problem_instance"]["feed_situation_index"] == feed_index]
+                destination_full_path = f"{destination_path}/generated_flowsheets.pickle"
+                destination_full_path_complete = f"{destination_path}/complete_generated_flowsheets.pickle"
                 
-                merged_fs = sorted(merged_fs, key=lambda x: x["obj"], reverse=True)[
-                                    :self.gumbeldore_config["num_trajectories_to_keep"]]
-                # Pickle the generated data again
+                # Load global historical reserve
+                existing_fs = []
+
+                if os.path.isfile(destination_full_path_complete):
+                    with open(destination_full_path_complete, "rb") as f:
+                        existing_fs = pickle.load(f)
+
+                existing_per_instance = defaultdict(list)
+
+                for fs in existing_fs:
+                    key = (fs["problem_instance"]["feed_situation_index"], tuple(np.round(fs["problem_instance"]["list_feed_streams"][0], 6)))
+                    existing_per_instance[key].append(fs)
+
+
+                # ---------------------------------------------------------
+                # For every instance sampled THIS round:
+                #
+                # old flowsheets for this instance
+                #            +
+                # newly generated flowsheets
+                #            ↓
+                #          Top-K
+                # ---------------------------------------------------------
+                expert_min_obj = self.gumbeldore_config.get("expert_min_obj", 0.30)
+                merged_fs = []
+
+                for key, current_instances in per_feed_index.items():
+                    previous_instances = existing_per_instance.get(key, [])
+
+                    # Best result found for this feed THIS round
+                    best_current_obj = max((fs["obj"] for fs in current_instances), default=float("-inf"))
+
+                    if best_current_obj >= expert_min_obj:
+                        current_expert_candidates = current_instances
+                    else:
+                        current_expert_candidates = []
+
+                    all_instances = previous_instances + current_expert_candidates
+                    valid_instances = [fs for fs in all_instances if int(self.env_config.action_limits[fs["subsystem"]]["min_total_units"]) <= fs["total_units_placed"] <= int(self.env_config.action_limits[fs["subsystem"]]["max_total_units"])]
+                        
+                    # Top-K over HISTORICAL + CURRENT solutions
+                    top_k = sorted(valid_instances, key=lambda x: x["obj"], reverse=True)[:self.gumbeldore_config["num_trajectories_to_keep"]]
+                    merged_fs.extend(top_k)
+                
+                # Save expert trajectory dataset
                 with open(destination_full_path, "wb") as f:
                     pickle.dump(merged_fs, f)
 
-            # Get overall best metrics and flowsheets
-            metrics_return["mean_top_20_obj"] = np.array([x["obj"] for x in merged_fs[:20]]).mean()
-            metrics_return["mean_kept_obj"] = np.array([x["obj"] for x in merged_fs]).mean()
-            metrics_return["top_20_flowsheets"] = [{x["identifier"]: x["obj"] for x in merged_fs[:20]}]
+                dump_top_flowsheets_txt(merged_fs, destination_path, epoch, if_test)
+
+                # Update elite replay buffer
+                self.update_replay_buffer(instances=instances, destination_path=destination_path)
+
+                # complete_generated_flowsheets.pickle:
+                # global reserve containing ALL newly sampled flowsheets
+                complete_fs = existing_fs + instances
+
+                # Pickle complete data
+                with open(destination_full_path_complete, "wb") as f:
+                    pickle.dump(complete_fs, f)
 
             return metrics_return, destination_full_path
 
@@ -191,9 +294,21 @@ def async_sbs_worker(gen_config, env_config, job_pool: JobPool, network_weights:
                      ):
     
     def child_log_probability_fn(trajectories: List[FlowsheetDesign]) -> [np.array]:
-        return FlowsheetDesign.log_probability_fn(config = gen_config, trajectories=trajectories, network=network, device=device)
+        return FlowsheetDesign.log_probability_fn(trajectories=trajectories, network=network, device=device, 
+                                                  gen_config = gen_config, env_config=env_config)
     
+    '''def batch_leaf_evaluation_fn(trajectories: List[FlowsheetDesign]) -> np.array:
+        objs = [traj.objective for traj in trajectories]
+        return objs'''
+
     def batch_leaf_evaluation_fn(trajectories: List[FlowsheetDesign]) -> np.array:
+        for traj in trajectories:
+            npv = traj.objective 
+            literature_ratio = traj.literature_bonus
+            per_ratio = traj.sim.performance_ratio
+            traj.objective = npv 
+
+        
         objs = [traj.objective for traj in trajectories]
         return objs
 
@@ -261,7 +376,7 @@ def async_sbs_worker(gen_config, env_config, job_pool: JobPool, network_weights:
 
             results_to_push = []
             for j, result_idx in enumerate(idx_list):
-                result: List[FlowsheetDesign] = [x.state for x in beam_leaves_batch[j][:gen_config.gumbeldore_config["num_trajectories_to_keep"]]]
+                result: List[FlowsheetDesign] = [x.state for x in beam_leaves_batch[j][:gen_config.gumbeldore_config["beam_width"]]]
 
                 # Check if they need objective evaluation (this will only be true for deterministic beam search
                 if result[0].objective is None:
