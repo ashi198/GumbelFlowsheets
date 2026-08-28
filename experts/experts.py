@@ -4,18 +4,18 @@ from model.core_transformer_block import CoreTransformerEncoder
 
 
 # Implementation of all unit expert 
-# normalization for AddSolvent components? 
 # normalization for interaction components in Flow Expert? 
 
 class DistillationColumn(nn.Module):
     
-    def __init__(self, config):
+    def __init__(self, gen_config, env_config):
         super(DistillationColumn, self).__init__()
         self.name = "distillation_column"
-        self.config = config 
-        self.latent_dim = self.config.latent_dim
+        self.gen_config = gen_config 
+        self.env_config = env_config
+        self.latent_dim = self.gen_config.latent_dim
         self.logit_linear = nn.Linear(in_features = self.latent_dim, out_features = 1)
-        self.df_categorical = nn.Linear(in_features = self.latent_dim, out_features = 100)
+        self.df_categorical = nn.Linear(in_features = self.latent_dim, out_features = len(self.env_config.DF_distillation_map))
         self.df_and_type_embed = nn.Linear(in_features = 1, out_features=self.latent_dim, bias = True)
 
 
@@ -23,7 +23,7 @@ class DistillationColumn(nn.Module):
         df = node_data["params"]["df"]
 
         # convert into a tensor
-        df_tensor = torch.tensor([float(df)], dtype=torch.float32, device= self.config.training_device)
+        df_tensor = torch.tensor([float(df)], dtype=torch.float32, device= self.gen_config.training_device)
 
         return self.df_and_type_embed(df_tensor)
         
@@ -98,18 +98,19 @@ class Mixer(nn.Module):
     
 
 class Split(nn.Module):
-    def __init__(self, config):
+    def __init__(self, gen_config, env_config):
         super(Split, self).__init__()
         self.name = "split"
-        self.config = config 
-        self.latent_dim = self.config.latent_dim
+        self.gen_config = gen_config 
+        self.env_config = env_config
+        self.latent_dim = self.gen_config.latent_dim
         self.logit_linear = nn.Linear(in_features = self.latent_dim, out_features = 1)
-        self.split_ratio_categorical = nn.Linear(in_features = self.latent_dim, out_features = 100)
+        self.split_ratio_categorical = nn.Linear(in_features = self.latent_dim, out_features = len(self.env_config.split_ratio_map))
         self.split_ratio_and_type_embed = nn.Linear(in_features= 1, out_features= self.latent_dim, bias = True)
 
     def embed(self, node_data: dict):
         sr = node_data["params"]["split_ratio"]
-        sr_tensor = torch.tensor([float(sr)], dtype=torch.float32, device=self.config.training_device)
+        sr_tensor = torch.tensor([float(sr)], dtype=torch.float32, device=self.gen_config.training_device)
         return self.split_ratio_and_type_embed(sr_tensor)
         
     def predict(self, x: torch.FloatTensor):
@@ -163,10 +164,20 @@ class AddSolvent(nn.Module):
         self.logit_linear = nn.Linear(in_features = self.latent_dim, out_features = 1)
         self.type_embed = nn.Linear(in_features= 3, out_features = self.latent_dim, bias= True)
 
+
+        component_data = env_config.components_tensor.float()
+        component_mean = component_data.mean(dim=0)
+        component_std = component_data.std(dim=0).clamp_min(1e-6)
+
+        self.norm_component = {}
+        self.norm_component["component_mean"] = component_mean
+        self.norm_component["component_std"] = component_std
+        self.norm_component["components_tensor"] = component_data
+
         self.prediction_mlp = nn.Sequential(
             nn.Linear(self.latent_dim + 3, 2 * self.latent_dim),
             nn.SiLU(),
-            nn.Linear(2 * self.latent_dim, 1 + 100) # for logit and amount discretized to 100 categories
+            nn.Linear(2 * self.latent_dim, 1 + len(self.env_config._amount_grid)) # for logit and amount discretized to 100 categories
         )
 
     def embed(self, x):
@@ -181,6 +192,7 @@ class AddSolvent(nn.Module):
 
         # all possible components 
         components = self.env_config.components_tensor.to(device=self.gen_config.training_device)
+        components = (components - self.norm_component["component_mean"].to(x.device, x.dtype)) / self.norm_component["component_std"].to(x.device, x.dtype)
 
         batch_size, num_nodes, _ = x.size()
         num_components, _ = components.size()
@@ -230,6 +242,10 @@ class ComponentsExpert(nn.Module):
         interaction_params = gamma.unsqueeze(-1).to(device=self.gen_config.training_device)
 
         return self.component_linear(compon_tensor), self.edge_linear(interaction_params)
+
+    def forward_raw(self, system_pure_crit: torch.Tensor, interaction_params: torch.Tensor):
+        """Encode an already padded batch of physical property inputs."""
+        return self.component_linear(system_pure_crit), self.edge_linear(interaction_params)
     
 class FlowExpert(nn.Module):
     def __init__(self, gen_config, env_config):
@@ -244,9 +260,6 @@ class FlowExpert(nn.Module):
             CoreTransformerEncoder(d_model= self.flow_latent_dim, nhead=4, dropout=self.gen_config.dropout)
             for _ in range(self.gen_config.num_trf_flow_blocks)
         ])
-
-    def get_outlet(self, x, key):
-        return torch.tensor(x.get(key, [0.0, 0.0, 0.0]), device=self.gen_config.training_device, dtype=torch.float32.unsqueeze(0).unsqueeze(-1))
 
     def forward(self, x, component_emb, interaction_emb):
 
@@ -267,27 +280,46 @@ class FlowExpert(nn.Module):
         edges = interaction_emb.unsqueeze(0).repeat(amount_outlets.shape[0], 1, 1, 1) # duplicate twice (num_outlets, num_components, num_components, flow_latent_dim)
 
         for block in self.blocks:
-            transformed_nodes = block(nodes, edges) 
+            nodes = block(nodes, edges)
         
-        flow_embedding = transformed_nodes.mean(dim=1) # (num_outlets, flow_latent_dim)
+        flow_embedding = nodes.mean(dim=1) # (num_outlets, flow_latent_dim)
         return self.flow_latent_upscale(flow_embedding) # (num_outlets, latent_dim)
+
+    def forward_raw(self, output_flows: torch.Tensor, component_emb: torch.Tensor,
+                    interaction_emb: torch.Tensor) -> torch.Tensor:
+        """Encode padded node/outlet flow amounts in one batched operation."""
+        batch_size, num_nodes, num_outlets, num_components = output_flows.shape
+        amount_outlets = output_flows.reshape(
+            batch_size * num_nodes * num_outlets, num_components, 1
+        )
+        component_emb = component_emb[:, None, None, :, :].expand(
+            batch_size, num_nodes, num_outlets, -1, -1
+        ).reshape(batch_size * num_nodes * num_outlets, num_components, -1)
+        interaction_emb = interaction_emb[:, None, None, :, :, :].expand(
+            batch_size, num_nodes, num_outlets, -1, -1, -1
+        ).reshape(batch_size * num_nodes * num_outlets, num_components, num_components, -1)
+
+        nodes = component_emb * amount_outlets
+        edges = interaction_emb
+        for block in self.blocks:
+            nodes = block(nodes, edges)
+
+        flow_embedding = nodes.mean(dim=1)
+        return self.flow_latent_upscale(flow_embedding).reshape(
+            batch_size, num_nodes, num_outlets, -1
+        )
     
 class EdgeFlowExpert(nn.Module):
     def __init__(self, config, flow_expert: FlowExpert):
         super(EdgeFlowExpert, self).__init__()
-        self.flow_expert = flow_expert 
+        # The shared flow encoder is owned and checkpointed by StateEncoder;
+        # this expert does not invoke it directly.
+        object.__setattr__(self, "_flow_expert_ref", flow_expert)
         self.config = config
         self.latent_dim = self.config.latent_dim
         self.is_recycle_emb = nn.Embedding(num_embeddings = 2, embedding_dim = self.latent_dim) # 0 for no, 1 for yes
 
-        # no edge connection embedding 
-        self.no_edge_emb = nn.Embedding(num_embeddings = 2, embedding_dim = self.latent_dim) # 0 for no, 1 for yes
-
     def forward(self, edge_exists: bool, is_recycle: bool, edge=None, feed_emb = None):
-
-        '''if not edge_exists: 
-            edge_idx = torch.tensor(0, dtype=torch.long, device=self.config.training_device)
-            return self.no_edge_emb(edge_idx)'''
 
         # if an edge exists (in cases of a single open stream or virtual node)
         #edge_idx = torch.tensor(1, dtype=torch.long, device=self.config.training_device)
@@ -305,15 +337,16 @@ class EdgeFlowExpert(nn.Module):
 class OpenStreamExpert(nn.Module):
     def __init__(self, gen_config, env_config, flow_expert: FlowExpert):
         super(OpenStreamExpert, self).__init__()
-        self.flow_expert = flow_expert 
+        # The shared flow encoder is checkpointed by its owning StateEncoder;
+        # keep this non-registering reference for the legacy direct call path.
+        object.__setattr__(self, "_flow_expert_ref", flow_expert)
         self.gen_config = gen_config
         self.env_config = env_config
         self.latent_dim = self.gen_config.latent_dim
         self.linear_transform_open_stream = nn.Linear(self.latent_dim, self.latent_dim, bias = True)
 
     def forward(self, x, compon_emb, interaction_emb):
-        latent_flow = self.flow_expert(x, compon_emb, interaction_emb) 
+        latent_flow = self._flow_expert_ref(x, compon_emb, interaction_emb)
         open_stream_embed = self.linear_transform_open_stream(latent_flow)
 
         return latent_flow, open_stream_embed
-

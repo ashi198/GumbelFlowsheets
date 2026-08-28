@@ -32,15 +32,28 @@ class RandomDataset(Dataset):
     to the padded nodes to -1 (in the CE-loss, this will be specified as `ignore_index=-1`.
 
     """
-    def __init__(self, gen_config, env_config,  path_to_pickle: str, batch_size: int, custom_num_batches: Optional[int],
+    def __init__(self, epoch, gen_config, env_config,  path_to_pickle: str, batch_size: int, custom_num_batches: Optional[int],
                  no_random: bool = False):
+        self.epoch = epoch
         self.gen_config = gen_config
         self.env_config = env_config
         self.batch_size = batch_size
         self.custom_num_batches = custom_num_batches
-        self.path_to_pickle = path_to_pickle
-        with open(path_to_pickle, "rb") as f:
-            self.instances = pickle.load(f)  # list of dictionaries
+
+        if epoch == self.gen_config.gumbeldore_config['replay_every']:
+            replay_path = f"{gen_config.results_path}/replay_buffer.pickle"
+            self.path_to_pickle = path_to_pickle
+            with open(self.path_to_pickle, "rb") as f:
+                expert_traj = pickle.load(f)  # list of dictionaries
+            with open(replay_path, "rb") as f:
+                replay_traj = pickle.load(f)  # list of dictionaries
+            self.instances = expert_traj + replay_traj
+            print("--- Training on replay buffer ---")
+
+        else:
+            self.path_to_pickle = path_to_pickle
+            with open(path_to_pickle, "rb") as f:
+                self.instances = pickle.load(f)  # list of dictionaries
 
         # We want to uniformly sample from partial flowsheets. So for each instance, check how many partial flowsheets
         # there are, and create a list of them where each entry is a tuple (int, int), where first entry is index of
@@ -77,8 +90,10 @@ class RandomDataset(Dataset):
                 fs.level = instance['levels'][j] 
                 self._flat_levels.append(fs.level)
                 if j + 1 < len(instance["levels"]):
-                    fs.take_action(action, instance['levels'][j + 1])
-                    #fs.take_action(action, None)
+                    '''if fs.current_action_mask[action] == 0:
+                        raise ValueError(f"Trying to take action {action} on level {fs.level}, but it is set to infeasible")
+                    fs.take_action(action, instance['levels'][j + 1])'''
+                    fs.take_action(action, None)
                 else:
                     fs.take_action(action, None)
 
@@ -121,7 +136,7 @@ class RandomDataset(Dataset):
         # Create the input batch from the partial flowsheets.
         batch_input = FlowsheetDesign.list_to_batch(flowsheets=partial_sequences,
                                                    device=torch.device("cpu"),
-                                                   include_feasibility_masks=True)
+                                                   include_feasibility_masks=True, env_config=self.env_config)
 
         # We now create the targets. We separate it into targets for level 0, 1, 2, and 3.
         # We only set the target action as target for the current level the flowsheet is in.
@@ -137,10 +152,6 @@ class RandomDataset(Dataset):
                 torch.full_like(targets, -1)) # # For all other levels, we set it to -1 for a molecule.
             for level in (0, 1, 2, 3)
         ]
-
-        batch_input['batch_latent_nodes_embeds'] = batch_input['batch_latent_nodes_embeds'].detach()
-        batch_input['batch_latent_edges_embeds'] = batch_input['batch_latent_edges_embeds'].detach()
-        batch_input['batch_latent_open_streams_embeds'] = batch_input['batch_latent_open_streams_embeds'].detach()
 
         samples = dict(
             input=batch_input,
