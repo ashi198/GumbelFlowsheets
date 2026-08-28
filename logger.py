@@ -2,6 +2,7 @@ import os
 import inspect
 import json, pickle
 from typing import Optional
+import numpy as np
 
 
 class Logger:
@@ -42,8 +43,3 @@ class Logger:
             with open(self.file_log_path, "a+") as f:
                 f.write(json.dumps(metrics, default=str))
                 f.write("\n")
-
-    def text_artifact(self, dest_text: str, obj):
-            
-        with open(dest_text, "w") as f:
-            f.write(str(obj))
